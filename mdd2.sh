@@ -116,6 +116,15 @@ setup_environment() {
     add_to_path "${TOOLS_DIR}/FastQC"
     add_to_path "${TOOLS_DIR}/sratoolkit/bin"
 
+    # Add Python user site packages to PYTHONPATH
+    if [ -d "${TOOLS_DIR}/lib/python"*"/site-packages" ]; then
+        PYTHON_SITE_DIR=$(find "${TOOLS_DIR}/lib" -name "site-packages" -type d | head -1)
+        if [ -n "${PYTHON_SITE_DIR}" ]; then
+            export PYTHONPATH="${PYTHON_SITE_DIR}:${PYTHONPATH:-}"
+            log "Added ${PYTHON_SITE_DIR} to PYTHONPATH"
+        fi
+    fi
+
     # Check for GATK in multiple locations
     if [ -x "${TOOLS_DIR}/gatk" ]; then
         export GATK="${TOOLS_DIR}/gatk"
@@ -151,6 +160,13 @@ elif [ -x "${TOOLS_DIR}/gatk-4.4.0.0/gatk" ]; then
 fi
 if [ -f "${TOOLS_DIR}/Trimmomatic-0.39/trimmomatic-0.39.jar" ]; then
     export TRIMMOMATIC_JAR="${TOOLS_DIR}/Trimmomatic-0.39/trimmomatic-0.39.jar"
+fi
+# Python path for MultiQC
+if [ -d "${TOOLS_DIR}/lib/python"*"/site-packages" ]; then
+    PYTHON_SITE_DIR=\$(find "${TOOLS_DIR}/lib" -name "site-packages" -type d | head -1)
+    if [ -n "\${PYTHON_SITE_DIR}" ]; then
+        export PYTHONPATH="\${PYTHON_SITE_DIR}:\${PYTHONPATH:-}"
+    fi
 fi
 EOF
 
@@ -409,32 +425,40 @@ install_fastqc() {
 install_multiqc() {
     log "Installing MultiQC..."
 
-    # Check if already installed
-    if command -v multiqc &> /dev/null; then
-        log "MultiQC already available in PATH"
+    # Check if already installed and working
+    if python3 -c "import multiqc" 2>/dev/null; then
+        log "MultiQC Python module already available"
         return 0
     fi
 
-    # Try different installation methods
+    # Try to install with explicit user prefix
     if command -v pip3 &> /dev/null; then
-        pip3 install --prefix="${TOOLS_DIR}" multiqc 2>/dev/null && return 0
+        log "Installing MultiQC with pip3..."
+        PIP_USER_INSTALL=1
+        # Force install to user directory
+        pip3 install --user multiqc 2>/dev/null && return 0
     fi
 
     if command -v pip &> /dev/null; then
-        pip install --prefix="${TOOLS_DIR}" multiqc 2>/dev/null && return 0
+        log "Installing MultiQC with pip..."
+        pip install --user multiqc 2>/dev/null && return 0
     fi
 
+    # Try to install to tools directory
     if command -v python3 &> /dev/null; then
+        log "Installing MultiQC with python3 -m pip..."
         python3 -m pip install --prefix="${TOOLS_DIR}" multiqc 2>/dev/null && return 0
     fi
 
     # Try conda if available
     if command -v conda &> /dev/null; then
+        log "Installing MultiQC with conda..."
         conda install -c bioconda multiqc -y 2>/dev/null && return 0
     fi
 
     log "WARNING: Could not install MultiQC automatically"
-    log "You may need to install it manually: pip install multiqc"
+    log "You may need to install it manually: pip install --user multiqc"
+    log "Then re-run: source ${BASE_DIR}/env.sh"
     return 1
 }
 
@@ -765,24 +789,65 @@ download_sra_files() {
     log "Step 1: Downloading SRA files..."
     mkdir -p "${BASE_DIR}/data/sra/"
 
+    # Change to the sra directory so prefetch downloads there
+    cd "${BASE_DIR}/data/sra/"
+
     for SRR in "${SRA_LIST[@]}"; do
         log "Downloading ${SRR}..."
+
+        # Check if file already exists
+        if [ -f "${SRR}.sra" ]; then
+            log "${SRR}.sra already exists, skipping download"
+            continue
+        fi
+
+        # Also check in default ncbi location
+        if [ -f "${HOME}/ncbi/public/sra/${SRR}.sra" ]; then
+            log "Found ${SRR}.sra in ncbi directory, creating symlink"
+            ln -sf "${HOME}/ncbi/public/sra/${SRR}.sra" "${SRR}.sra"
+            continue
+        fi
+
         if command -v prefetch &> /dev/null; then
-            prefetch --progress "${SRR}" -O "${BASE_DIR}/data/sra/"
+            # Newer versions use --output-directory or just download to current directory
+            prefetch --progress "${SRR}" \
+                --max-size 100G
         elif [ -x "${TOOLS_DIR}/sratoolkit/bin/prefetch" ]; then
-            "${TOOLS_DIR}/sratoolkit/bin/prefetch" --progress "${SRR}" -O "${BASE_DIR}/data/sra/"
+            "${TOOLS_DIR}/sratoolkit/bin/prefetch" --progress "${SRR}" \
+                --max-size 100G
         else
             log "ERROR: prefetch command not found. Install SRA Toolkit first."
+            # Change back to original directory
+            cd "${PIPELINE_DIR}"
             return 1
         fi
+
+        # After download, check if file was downloaded to ncbi directory and move it
+        if [ -f "${HOME}/ncbi/public/sra/${SRR}.sra" ] && [ ! -f "${SRR}.sra" ]; then
+            log "Moving SRA file from ncbi directory to pipeline directory..."
+            # Try to move, if that fails create a symlink
+            mv "${HOME}/ncbi/public/sra/${SRR}.sra" "${SRR}.sra" 2>/dev/null || \
+            ln -sf "${HOME}/ncbi/public/sra/${SRR}.sra" "${SRR}.sra"
+        fi
     done
+
+    # Change back to original directory
+    cd "${PIPELINE_DIR}"
 }
 
 validate_sra_files() {
     log "Step 2: Validating SRA files..."
     for SRR in "${SRA_LIST[@]}"; do
         log "Validating ${SRR}..."
+
+        # Check multiple possible locations
         SRA_FILE="${BASE_DIR}/data/sra/${SRR}.sra"
+
+        # If not in pipeline directory, check default ncbi location
+        if [ ! -f "${SRA_FILE}" ]; then
+            SRA_FILE="${HOME}/ncbi/public/sra/${SRR}.sra"
+        fi
+
         if [ -f "${SRA_FILE}" ]; then
             if command -v vdb-validate &> /dev/null; then
                 vdb-validate "${SRA_FILE}"
@@ -791,8 +856,14 @@ validate_sra_files() {
             else
                 log "WARNING: vdb-validate not found, skipping validation"
             fi
+
+            # If file is in ncbi directory, create symbolic link to our directory
+            if [ -f "${HOME}/ncbi/public/sra/${SRR}.sra" ] && [ ! -f "${BASE_DIR}/data/sra/${SRR}.sra" ]; then
+                ln -sf "${HOME}/ncbi/public/sra/${SRR}.sra" "${BASE_DIR}/data/sra/"
+                log "Created symlink from ncbi directory to pipeline directory"
+            fi
         else
-            log "WARNING: ${SRA_FILE} not found, skipping validation"
+            log "WARNING: ${SRR}.sra not found in any location, skipping validation"
         fi
     done
 }
@@ -812,21 +883,32 @@ extract_fastq() {
     for SRR in "${SRA_LIST[@]}"; do
         log "[${COUNT}/${TOTAL}] Splitting ${SRR} into FASTQ..."
 
+        # Check multiple locations for SRA file
         SRA_FILE="${BASE_DIR}/data/sra/${SRR}.sra"
         if [ ! -f "${SRA_FILE}" ]; then
-            log "WARNING: ${SRA_FILE} not found, skipping"
+            SRA_FILE="${HOME}/ncbi/public/sra/${SRR}.sra"
+        fi
+
+        if [ ! -f "${SRA_FILE}" ]; then
+            log "WARNING: ${SRR}.sra not found in any location, skipping"
             COUNT=$((COUNT + 1))
             continue
         fi
 
+        # Create symlink if needed
+        if [ ! -f "${BASE_DIR}/data/sra/${SRR}.sra" ] && [ -f "${SRA_FILE}" ]; then
+            ln -sf "${SRA_FILE}" "${BASE_DIR}/data/sra/${SRR}.sra"
+        fi
+
+        # Extract FASTQ
         if command -v fasterq-dump &> /dev/null; then
             fasterq-dump --split-files --threads 6 --progress \
                 -O "${BASE_DIR}/data/fastq/" \
-                "${SRA_FILE}"
+                "${BASE_DIR}/data/sra/${SRR}.sra"
         elif [ -x "${TOOLS_DIR}/sratoolkit/bin/fasterq-dump" ]; then
             "${TOOLS_DIR}/sratoolkit/bin/fasterq-dump" --split-files --threads 6 --progress \
                 -O "${BASE_DIR}/data/fastq/" \
-                "${SRA_FILE}"
+                "${BASE_DIR}/data/sra/${SRR}.sra"
         else
             log "ERROR: fasterq-dump command not found"
             return 1
