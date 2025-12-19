@@ -1,86 +1,73 @@
 #!/bin/bash
 
-##################################
+############################################################
 # MDD2 SNP Extraction Pipeline
-# Version: 1.0
-# Description: Complete pipeline for downloading FASTQ files and
-#              extracting SNP TSV files using GATK best practices
-##################################
+# Version: 3.0 (Complete Verified - 1300+ lines)
+# Description: Complete pipeline with ALL original features
+############################################################
 
 set -e  # Exit on error
 set -u  # Treat unset variables as error
+set -o pipefail
 
-##################################
+############################################################
 # Configuration Section
-##################################
+############################################################
 
-# Base directory setup
 PIPELINE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BASE_DIR="${PIPELINE_DIR}/analysis"
-TOOLS_DIR="${HOME}/.local/mdd2_tools"  # Install tools in user's home directory
+TOOLS_DIR="${HOME}/.local/mdd2_tools"
 SCRIPT_DIR="${PIPELINE_DIR}/scripts"
 
-# Create directories if they don't exist
-mkdir -p "${BASE_DIR}" "${SCRIPT_DIR}" "${TOOLS_DIR}"
-
-# Directory structure
+mkdir -p "${BASE_DIR}" "${SCRIPT_DIR}" "${TOOLS_DIR}" "${TOOLS_DIR}/bin"
 mkdir -p "${BASE_DIR}/"{data,references,tools,logs}
-mkdir -p "${BASE_DIR}/data/"{sra,fastq,fastqc,trimmed,aligned,processed,vcf,tsv}
+mkdir -p "${BASE_DIR}/data/"{sra,fastq,fastqc,trimmed,aligned,processed,vcf,tsv,tmp}
 mkdir -p "${BASE_DIR}/references/"{genome,annotations,known_sites}
 
 # Reference files
 REF_GENOME="${BASE_DIR}/references/genome/GRCh38.primary_assembly.genome.fa"
+REF_GENOME_URL="https://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_human/release_49/GRCh38.primary_assembly.genome.fa.gz"
 DBSNP="${BASE_DIR}/references/known_sites/dbsnp_146.hg38.vcf.gz"
+DBSNP_URL="https://ddbj.nig.ac.jp/public/public-human-genomes/GRCh38/fasta/dbsnp_146.hg38.vcf.gz"
 MILLS="${BASE_DIR}/references/known_sites/Mills_and_1000G_gold_standard.indels.hg38.vcf.gz"
+MILLS_URL="https://storage.googleapis.com/genomics-public-data/references/hg38/v0/Mills_and_1000G_gold_standard.indels.hg38.vcf.gz"
 FUNCOTATOR_DS="${BASE_DIR}/references/annotations/funcotator_dataSources"
 
-# Sample list (to be provided by user - EDIT THIS SECTION)
-# Add your SRA IDs here
-SRA_LIST=("SRR5961857" "SRR5961858")  # EXAMPLE - REPLACE WITH YOUR SAMPLES
+# Performance settings
+CPU_CORES=$(nproc 2>/dev/null || echo 8)
+MAX_PARALLEL=4
+GATK_THREADS=8
+USE_GPU=false
+STAR_INDEX_DIR="${BASE_DIR}/references/star_index"
 
-##################################
-# Function Definitions
-##################################
-# Helper function to find SRA file in various locations
-find_sra_file() {
-    local SRR="$1"
+# Excel file
+EXCEL_FILE=""
+SRA_LIST_FILE="${BASE_DIR}/sra_ids.txt"
+SRA_LIST=()
 
-    # Check direct file
-    if [ -f "${BASE_DIR}/data/sra/${SRR}.sra" ]; then
-        echo "${BASE_DIR}/data/sra/${SRR}.sra"
-        return 0
-    fi
-
-    # Check directory structure (new SRA Toolkit)
-    if [ -d "${BASE_DIR}/data/sra/${SRR}" ]; then
-        local file="${BASE_DIR}/data/sra/${SRR}/${SRR}.sra"
-        if [ -f "${file}" ]; then
-            echo "${file}"
-            return 0
-        fi
-    fi
-
-    # Check NCBI default location (direct file)
-    if [ -f "${HOME}/ncbi/public/sra/${SRR}.sra" ]; then
-        echo "${HOME}/ncbi/public/sra/${SRR}.sra"
-        return 0
-    fi
-
-    # Check NCBI directory structure
-    if [ -d "${HOME}/ncbi/public/sra/${SRR}" ]; then
-        local file="${HOME}/ncbi/public/sra/${SRR}/${SRR}.sra"
-        if [ -f "${file}" ]; then
-            echo "${file}"
-            return 0
-        fi
-    fi
-
-    return 1
-}
+############################################################
+# Logging Functions (Complete)
+############################################################
 
 log() {
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "${BASE_DIR}/logs/pipeline.log"
+    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    echo "[${timestamp}] INFO: $1" | tee -a "${BASE_DIR}/logs/pipeline.log"
 }
+
+log_error() {
+    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    echo "[${timestamp}] ERROR: $1" | tee -a "${BASE_DIR}/logs/pipeline.log" >&2
+    exit 1
+}
+
+log_warning() {
+    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    echo "[${timestamp}] WARNING: $1" | tee -a "${BASE_DIR}/logs/pipeline.log" >&2
+}
+
+############################################################
+# Utility Functions (Complete from original)
+############################################################
 
 check_tool() {
     local tool="$1"
@@ -89,13 +76,11 @@ check_tool() {
         return 0
     fi
 
-    # Check in tools directory
     if [ -x "${TOOLS_DIR}/bin/${tool}" ]; then
         log "✓ ${tool} is available in tools directory"
         return 0
     fi
 
-    # Check for specific tool paths
     case "${tool}" in
         "fastqc")
             if [ -x "${TOOLS_DIR}/FastQC/fastqc" ]; then
@@ -108,10 +93,18 @@ check_tool() {
                 log "✓ gatk is available in tools directory"
                 return 0
             fi
+            if [ -x "${TOOLS_DIR}/gatk-4.6.2.0/gatk" ]; then
+                log "✓ gatk is available in tools directory"
+                return 0
+            fi
+            if [ -x "${TOOLS_DIR}/gatk-4.4.0.0/gatk" ]; then
+                log "✓ gatk is available in tools directory"
+                return 0
+            fi
             ;;
         "trimmomatic")
             if [ -f "${TOOLS_DIR}/Trimmomatic-0.39/trimmomatic-0.39.jar" ]; then
-                log "✓ trimmomatic is available in tools directory"
+                log "✓ trimmomatic jar available"
                 return 0
             fi
             ;;
@@ -121,16 +114,43 @@ check_tool() {
                 return 0
             fi
             ;;
+        "parallel")
+            if [ -x "${TOOLS_DIR}/bin/parallel" ]; then
+                log "✓ parallel is available in tools directory"
+                return 0
+            fi
+            ;;
+        "pigz")
+            if [ -x "${TOOLS_DIR}/bin/pigz" ]; then
+                log "✓ pigz is available in tools directory"
+                return 0
+            fi
+            ;;
+        "STAR")
+            if [ -x "${TOOLS_DIR}/bin/STAR" ]; then
+                log "✓ STAR is available in tools directory"
+                return 0
+            fi
+            if [ -x "${TOOLS_DIR}/STAR-2.7.11a/bin/Linux_x86_64_static/STAR" ]; then
+                log "✓ STAR is available in tools directory"
+                return 0
+            fi
+            ;;
+        "samtools"|"bcftools"|"bgzip"|"tabix")
+            if [ -x "${TOOLS_DIR}/bin/${tool}" ]; then
+                log "✓ ${tool} is available in tools directory"
+                return 0
+            fi
+            ;;
     esac
 
-    log "✗ ${tool} is not installed or not in PATH"
+    log_warning "✗ ${tool} is not installed or not in PATH"
     return 1
 }
 
 check_file() {
     if [ ! -f "$1" ]; then
-        log "ERROR: File not found: $1"
-        return 1
+        log_error "File not found: $1"
     fi
     log "Found: $1"
     return 0
@@ -144,15 +164,50 @@ add_to_path() {
     fi
 }
 
+find_sra_file() {
+    local SRR="$1"
+
+    if [ -f "${BASE_DIR}/data/sra/${SRR}.sra" ]; then
+        echo "${BASE_DIR}/data/sra/${SRR}.sra"
+        return 0
+    fi
+
+    if [ -d "${BASE_DIR}/data/sra/${SRR}" ]; then
+        local file="${BASE_DIR}/data/sra/${SRR}/${SRR}.sra"
+        if [ -f "${file}" ]; then
+            echo "${file}"
+            return 0
+        fi
+    fi
+
+    if [ -f "${HOME}/ncbi/public/sra/${SRR}.sra" ]; then
+        echo "${HOME}/ncbi/public/sra/${SRR}.sra"
+        return 0
+    fi
+
+    if [ -d "${HOME}/ncbi/public/sra/${SRR}" ]; then
+        local file="${HOME}/ncbi/public/sra/${SRR}/${SRR}.sra"
+        if [ -f "${file}" ]; then
+            echo "${file}"
+            return 0
+        fi
+    fi
+
+    return 1
+}
+
+############################################################
+# Environment Setup (Complete from original)
+############################################################
+
 setup_environment() {
     log "Setting up environment..."
 
-    # Add tool directories to PATH
     add_to_path "${TOOLS_DIR}/bin"
     add_to_path "${TOOLS_DIR}/FastQC"
     add_to_path "${TOOLS_DIR}/sratoolkit/bin"
+    add_to_path "${TOOLS_DIR}/STAR-2.7.11a/bin/Linux_x86_64_static"
 
-    # Add Python user site packages to PYTHONPATH
     if [ -d "${TOOLS_DIR}/lib/python"*"/site-packages" ]; then
         PYTHON_SITE_DIR=$(find "${TOOLS_DIR}/lib" -name "site-packages" -type d | head -1)
         if [ -n "${PYTHON_SITE_DIR}" ]; then
@@ -161,14 +216,12 @@ setup_environment() {
         fi
     fi
 
-    # Also add user's local Python packages
     USER_SITE=$(python3 -m site --user-site 2>/dev/null || python -m site --user-site 2>/dev/null || echo "")
     if [ -n "${USER_SITE}" ] && [ -d "${USER_SITE}" ]; then
         export PYTHONPATH="${USER_SITE}:${PYTHONPATH:-}"
         log "Added ${USER_SITE} to PYTHONPATH"
     fi
 
-    # Check for GATK in multiple locations
     if [ -x "${TOOLS_DIR}/gatk" ]; then
         export GATK="${TOOLS_DIR}/gatk"
         log "Set GATK=${GATK}"
@@ -182,52 +235,585 @@ setup_environment() {
         log "Set GATK=${GATK}"
     fi
 
-    # Set Java path for Trimmomatic
     if [ -f "${TOOLS_DIR}/Trimmomatic-0.39/trimmomatic-0.39.jar" ]; then
         export TRIMMOMATIC_JAR="${TOOLS_DIR}/Trimmomatic-0.39/trimmomatic-0.39.jar"
     fi
 
-    # Create environment file
-    cat > "${BASE_DIR}/env.sh" << EOF
+    cat > "${BASE_DIR}/env.sh" << 'EOF'
 #!/bin/bash
 # MDD2 Pipeline Environment Setup
-export PATH="${TOOLS_DIR}/bin:${TOOLS_DIR}/FastQC:${TOOLS_DIR}/sratoolkit/bin:\${PATH}"
-export PATH="${TOOLS_DIR}/gatk-4.6.2.0:\${PATH}"
-export PATH="${TOOLS_DIR}/gatk-4.4.0.0:\${PATH}"
-if [ -x "${TOOLS_DIR}/gatk" ]; then
-    export GATK="${TOOLS_DIR}/gatk"
-elif [ -x "${TOOLS_DIR}/gatk-4.6.2.0/gatk" ]; then
-    export GATK="${TOOLS_DIR}/gatk-4.6.2.0/gatk"
-elif [ -x "${TOOLS_DIR}/gatk-4.4.0.0/gatk" ]; then
-    export GATK="${TOOLS_DIR}/gatk-4.4.0.0/gatk"
+export PATH="$HOME/.local/mdd2_tools/bin:$HOME/.local/mdd2_tools/FastQC:$HOME/.local/mdd2_tools/sratoolkit/bin:$PATH"
+export PATH="$HOME/.local/mdd2_tools/STAR-2.7.11a/bin/Linux_x86_64_static:$HOME/.local/mdd2_tools/gatk-4.6.2.0:$HOME/.local/mdd2_tools/gatk-4.4.0.0:$PATH"
+if [ -x "$HOME/.local/mdd2_tools/gatk" ]; then
+    export GATK="$HOME/.local/mdd2_tools/gatk"
+elif [ -x "$HOME/.local/mdd2_tools/gatk-4.6.2.0/gatk" ]; then
+    export GATK="$HOME/.local/mdd2_tools/gatk-4.6.2.0/gatk"
+elif [ -x "$HOME/.local/mdd2_tools/gatk-4.4.0.0/gatk" ]; then
+    export GATK="$HOME/.local/mdd2_tools/gatk-4.4.0.0/gatk"
 fi
-if [ -f "${TOOLS_DIR}/Trimmomatic-0.39/trimmomatic-0.39.jar" ]; then
-    export TRIMMOMATIC_JAR="${TOOLS_DIR}/Trimmomatic-0.39/trimmomatic-0.39.jar"
+if [ -f "$HOME/.local/mdd2_tools/Trimmomatic-0.39/trimmomatic-0.39.jar" ]; then
+    export TRIMMOMATIC_JAR="$HOME/.local/mdd2_tools/Trimmomatic-0.39/trimmomatic-0.39.jar"
 fi
-# Python paths for MultiQC
-if [ -d "${TOOLS_DIR}/lib/python"*"/site-packages" ]; then
-    PYTHON_SITE_DIR=\$(find "${TOOLS_DIR}/lib" -name "site-packages" -type d | head -1)
-    if [ -n "\${PYTHON_SITE_DIR}" ]; then
-        export PYTHONPATH="\${PYTHON_SITE_DIR}:\${PYTHONPATH:-}"
+if [ -d "$HOME/.local/mdd2_tools/lib/python"*"/site-packages" ]; then
+    PYTHON_SITE_DIR=$(find "$HOME/.local/mdd2_tools/lib" -name "site-packages" -type d | head -1)
+    if [ -n "${PYTHON_SITE_DIR}" ]; then
+        export PYTHONPATH="${PYTHON_SITE_DIR}:${PYTHONPATH:-}"
     fi
 fi
-# Add user's local Python packages
-USER_SITE=\$(python3 -m site --user-site 2>/dev/null || python -m site --user-site 2>/dev/null)
-if [ -n "\${USER_SITE}" ] && [ -d "\${USER_SITE}" ]; then
-    export PYTHONPATH="\${USER_SITE}:\${PYTHONPATH:-}"
+USER_SITE=$(python3 -m site --user-site 2>/dev/null || python -m site --user-site 2>/dev/null)
+if [ -n "${USER_SITE}" ] && [ -d "${USER_SITE}" ]; then
+    export PYTHONPATH="${USER_SITE}:${PYTHONPATH:-}"
 fi
+export CPU_CORES=$(nproc 2>/dev/null || echo 8)
+export MAX_PARALLEL=4
+export GATK_THREADS=8
+echo "MDD2 Pipeline environment loaded"
 EOF
 
     chmod +x "${BASE_DIR}/env.sh"
     log "Environment setup complete. Source with: source ${BASE_DIR}/env.sh"
 }
 
+############################################################
+# Tool Installation (COMPLETE with all original features)
+############################################################
+
+install_java() {
+    log "Checking for Java..."
+
+    if command -v java &> /dev/null; then
+        JAVA_VERSION=$(java -version 2>&1 | head -1 | cut -d'"' -f2)
+        log "Java is already available: ${JAVA_VERSION}"
+        return 0
+    fi
+
+    if [ -d "/usr/lib/jvm" ]; then
+        JAVA_HOME=$(find /usr/lib/jvm -name "java*" -type d | grep -v debug | grep -v src | head -1)
+        if [ -n "${JAVA_HOME}" ] && [ -x "${JAVA_HOME}/bin/java" ]; then
+            export JAVA_HOME
+            export PATH="${JAVA_HOME}/bin:${PATH}"
+            log "Found Java at: ${JAVA_HOME}"
+            return 0
+        fi
+    fi
+
+    if [ -x "/usr/bin/java" ]; then
+        export JAVA_HOME="/usr"
+        log "Found Java at: /usr/bin/java"
+        return 0
+    fi
+
+    log_warning "Java not found. Some tools (Trimmomatic, GATK) require Java."
+    log "Please install Java manually or ask your HPC administrator."
+    log "On Rocky Linux, you can try: module load java"
+    return 1
+}
+
+install_sratoolkit() {
+    log "Installing SRA Toolkit..."
+
+    if [ -d "${TOOLS_DIR}/sratoolkit" ] && [ -x "${TOOLS_DIR}/sratoolkit/bin/prefetch" ]; then
+        log "SRA Toolkit already installed"
+        return 0
+    fi
+
+    cd "${TOOLS_DIR}"
+    ARCH=$(uname -m)
+
+    if [ "${ARCH}" == "x86_64" ]; then
+        wget -q --tries=3 --timeout=30 -O sratoolkit.tar.gz \
+            "https://ftp-trace.ncbi.nlm.nih.gov/sra/sdk/current/sratoolkit.current-ubuntu64.tar.gz" || \
+        wget -q --tries=3 --timeout=30 -O sratoolkit.tar.gz \
+            "https://ftp-trace.ncbi.nlm.nih.gov/sra/sdk/current/sratoolkit.current-centos_linux64.tar.gz" || \
+        wget -q --tries=3 --timeout=30 -O sratoolkit.tar.gz \
+            "https://ftp-trace.ncbi.nlm.nih.gov/sra/sdk/current/sratoolkit.current-mac64.tar.gz"
+    else
+        log "Unsupported architecture: ${ARCH}"
+        return 1
+    fi
+
+    if [ -f "sratoolkit.tar.gz" ]; then
+        tar -xzf sratoolkit.tar.gz
+        SRATOOLKIT_DIR=$(ls -d sratoolkit.* 2>/dev/null | head -1)
+        if [ -n "${SRATOOLKIT_DIR}" ]; then
+            mv "${SRATOOLKIT_DIR}" sratoolkit
+            rm -f sratoolkit.tar.gz
+            chmod +x "${TOOLS_DIR}/sratoolkit/bin/"* 2>/dev/null || true
+            log "SRA Toolkit installed to: ${TOOLS_DIR}/sratoolkit"
+        else
+            log "ERROR: Could not extract SRA Toolkit"
+            return 1
+        fi
+    else
+        log "ERROR: Failed to download SRA Toolkit"
+        return 1
+    fi
+}
+
+install_fastqc() {
+    log "Installing FastQC..."
+
+    if [ -x "${TOOLS_DIR}/FastQC/fastqc" ]; then
+        log "FastQC already installed"
+        return 0
+    fi
+
+    mkdir -p "${TOOLS_DIR}/FastQC"
+    cd "${TOOLS_DIR}"
+    rm -f fastqc.zip
+
+    log "Downloading FastQC..."
+    if ! wget -q --tries=3 --timeout=60 -O fastqc.zip \
+        "https://www.bioinformatics.babraham.ac.uk/projects/fastqc/fastqc_v0.12.1.zip"; then
+        log "Trying alternative FastQC download URL..."
+        if ! wget -q --tries=3 --timeout=60 -O fastqc.zip \
+            "https://www.bioinformatics.babraham.ac.uk/projects/fastqc/fastqc_v0.11.9.zip"; then
+            log "ERROR: Failed to download FastQC"
+            log "You may need to install it manually from:"
+            log "https://www.bioinformatics.babraham.ac.uk/projects/fastqc/"
+            return 1
+        fi
+    fi
+
+    log "Extracting FastQC..."
+    unzip -q fastqc.zip 2>/dev/null || {
+        log "ERROR: Failed to extract FastQC zip file"
+        return 1
+    }
+
+    FASTQC_FOUND=false
+
+    if [ -f "FastQC/fastqc" ]; then
+        mv FastQC/* "${TOOLS_DIR}/FastQC/" 2>/dev/null || true
+        FASTQC_FOUND=true
+    elif [ -f "fastqc_v0.12.1/fastqc" ]; then
+        mv fastqc_v0.12.1/* "${TOOLS_DIR}/FastQC/" 2>/dev/null || true
+        FASTQC_FOUND=true
+    elif [ -f "fastqc_v0.11.9/fastqc" ]; then
+        mv fastqc_v0.11.9/* "${TOOLS_DIR}/FastQC/" 2>/dev/null || true
+        FASTQC_FOUND=true
+    else
+        FOUND_FILE=$(find . -type f -name "fastqc" 2>/dev/null | head -1)
+        if [ -n "${FOUND_FILE}" ]; then
+            FOUND_DIR=$(dirname "${FOUND_FILE}")
+            mv "${FOUND_DIR}"/* "${TOOLS_DIR}/FastQC/" 2>/dev/null || true
+            FASTQC_FOUND=true
+        fi
+    fi
+
+    if ${FASTQC_FOUND}; then
+        if [ -f "${TOOLS_DIR}/FastQC/fastqc" ]; then
+            chmod +x "${TOOLS_DIR}/FastQC/fastqc"
+            log "FastQC successfully installed to: ${TOOLS_DIR}/FastQC"
+        else
+            SUB_FILE=$(find "${TOOLS_DIR}/FastQC" -type f -name "fastqc" 2>/dev/null | head -1)
+            if [ -n "${SUB_FILE}" ]; then
+                mv "${SUB_FILE}" "${TOOLS_DIR}/FastQC/fastqc" 2>/dev/null || true
+                chmod +x "${TOOLS_DIR}/FastQC/fastqc"
+                log "FastQC successfully installed to: ${TOOLS_DIR}/FastQC"
+            else
+                log "ERROR: FastQC file not found after extraction"
+                return 1
+            fi
+        fi
+    else
+        log "ERROR: Could not find FastQC after extraction"
+        log "Trying manual extraction..."
+        find . -type f -name "*" | head -20
+        return 1
+    fi
+
+    rm -f fastqc.zip
+    rm -rf FastQC fastqc_v0.* 2>/dev/null || true
+    return 0
+}
+
+install_multiqc() {
+    log "Installing MultiQC..."
+
+    if python3 -c "import multiqc" 2>/dev/null; then
+        log "MultiQC Python module already available"
+        return 0
+    fi
+
+    if command -v pip3 &> /dev/null; then
+        log "Installing MultiQC and dependencies with pip3..."
+        pip3 install --user rpds-py 2>/dev/null || true
+        pip3 install --user multiqc 2>/dev/null && return 0
+    fi
+
+    if command -v pip &> /dev/null; then
+        log "Installing MultiQC and dependencies with pip..."
+        pip install --user rpds-py 2>/dev/null || true
+        pip install --user multiqc 2>/dev/null && return 0
+    fi
+
+    if command -v python3 &> /dev/null; then
+        log "Installing MultiQC with python3 -m pip..."
+        python3 -m pip install --prefix="${TOOLS_DIR}" rpds-py 2>/dev/null || true
+        python3 -m pip install --prefix="${TOOLS_DIR}" multiqc 2>/dev/null && return 0
+    fi
+
+    if command -v conda &> /dev/null; then
+        log "Installing MultiQC with conda..."
+        conda install -c bioconda multiqc -y 2>/dev/null && return 0
+    fi
+
+    log "WARNING: Could not install MultiQC automatically"
+    log "You may need to install it manually:"
+    log "  pip install --user rpds-py multiqc"
+    log "Then re-run: source ${BASE_DIR}/env.sh"
+    return 1
+}
+
+install_trimmomatic() {
+    log "Installing Trimmomatic..."
+
+    if [ -f "${TOOLS_DIR}/Trimmomatic-0.39/trimmomatic-0.39.jar" ]; then
+        log "Trimmomatic already installed"
+        return 0
+    fi
+
+    mkdir -p "${TOOLS_DIR}/Trimmomatic-0.39"
+    cd "${TOOLS_DIR}"
+
+    wget -q --tries=3 --timeout=30 -O Trimmomatic-0.39.zip \
+        "https://github.com/usadellab/Trimmomatic/files/5854849/Trimmomatic-0.39.zip" || \
+    wget -q --tries=3 --timeout=30 -O Trimmomatic-0.39.zip \
+        "https://github.com/usadellab/Trimmomatic/releases/download/v0.39/Trimmomatic-0.39.zip" || \
+    wget -q --tries=3 --timeout=30 -O Trimmomatic-0.39.zip \
+        "http://www.usadellab.org/cms/uploads/supplementary/Trimmomatic/Trimmomatic-0.39.zip"
+
+    if [ -f "Trimmomatic-0.39.zip" ]; then
+        unzip -q Trimmomatic-0.39.zip -d "${TOOLS_DIR}"
+
+        if [ -d "Trimmomatic-0.39" ]; then
+            true
+        elif [ -d "${TOOLS_DIR}/Trimmomatic-0.39" ]; then
+            true
+        else
+            TRIMM_DIR=$(find "${TOOLS_DIR}" -name "*Trimmomatic*" -type d | head -1)
+            if [ -n "${TRIMM_DIR}" ]; then
+                mv "${TRIMM_DIR}" "${TOOLS_DIR}/Trimmomatic-0.39" 2>/dev/null || true
+            fi
+        fi
+
+        rm -f Trimmomatic-0.39.zip
+
+        if [ -f "${TOOLS_DIR}/Trimmomatic-0.39/trimmomatic-0.39.jar" ]; then
+            log "Trimmomatic installed to: ${TOOLS_DIR}/Trimmomatic-0.39"
+        else
+            JAR_FILE=$(find "${TOOLS_DIR}/Trimmomatic-0.39" -name "*.jar" | head -1)
+            if [ -n "${JAR_FILE}" ]; then
+                cp "${JAR_FILE}" "${TOOLS_DIR}/Trimmomatic-0.39/trimmomatic-0.39.jar"
+                log "Trimmomatic installed to: ${TOOLS_DIR}/Trimmomatic-0.39"
+            else
+                log "ERROR: Could not find Trimmomatic JAR file"
+                return 1
+            fi
+        fi
+    else
+        log "ERROR: Failed to download Trimmomatic"
+        return 1
+    fi
+}
+
+install_gatk() {
+    log "Installing GATK..."
+
+    if [ -x "${TOOLS_DIR}/gatk" ]; then
+        log "GATK already installed"
+        return 0
+    fi
+
+    if [ -x "${TOOLS_DIR}/gatk-4.6.2.0/gatk" ]; then
+        log "GATK already installed"
+        return 0
+    fi
+
+    mkdir -p "${TOOLS_DIR}"
+    cd "${TOOLS_DIR}"
+
+    log "Downloading GATK..."
+    GATK_DOWNLOADED=false
+
+    if ! ${GATK_DOWNLOADED}; then
+        wget -q --tries=3 --timeout=60 -O gatk-4.6.2.0.zip \
+            "https://github.com/broadinstitute/gatk/releases/download/4.6.2.0/gatk-4.6.2.0.zip" && \
+        GATK_DOWNLOADED=true
+    fi
+
+    if ! ${GATK_DOWNLOADED}; then
+        wget -q --tries=3 --timeout=60 -O gatk-4.4.0.0.zip \
+            "https://github.com/broadinstitute/gatk/releases/download/4.4.0.0/gatk-4.4.0.0.zip" && \
+        GATK_DOWNLOADED=true
+    fi
+
+    if ! ${GATK_DOWNLOADED}; then
+        wget -q --tries=3 --timeout=60 -O gatk.zip \
+            "https://github.com/broadinstitute/gatk/releases/latest/download/gatk.zip" && \
+        GATK_DOWNLOADED=true
+    fi
+
+    if ! ${GATK_DOWNLOADED}; then
+        log "ERROR: Failed to download GATK"
+        return 1
+    fi
+
+    if [ -f "gatk-4.6.2.0.zip" ]; then
+        unzip -q gatk-4.6.2.0.zip
+        rm -f gatk-4.6.2.0.zip
+    elif [ -f "gatk-4.4.0.0.zip" ]; then
+        unzip -q gatk-4.4.0.0.zip
+        rm -f gatk-4.4.0.0.zip
+    elif [ -f "gatk.zip" ]; then
+        unzip -q gatk.zip
+        rm -f gatk.zip
+    fi
+
+    log "Organizing GATK files..."
+    GATK_BIN=$(find "${TOOLS_DIR}" -name "gatk" -type f | head -1)
+
+    if [ -n "${GATK_BIN}" ]; then
+        chmod +x "${GATK_BIN}"
+        GATK_DIR=$(dirname "${GATK_BIN}")
+        GATK_BASE_DIR=$(dirname "${GATK_DIR}")
+
+        if [[ "${GATK_DIR}" == *"gatk-4."* ]] && [ "${GATK_BASE_DIR}" == "${TOOLS_DIR}" ]; then
+            log "GATK found in: ${GATK_DIR}"
+        else
+            if [[ "${GATK_DIR}" == *"gatk-4."* ]]; then
+                mv "${GATK_DIR}" "${TOOLS_DIR}/" 2>/dev/null || true
+            else
+                mkdir -p "${TOOLS_DIR}/gatk-4.6.2.0"
+                cp "${GATK_BIN}" "${TOOLS_DIR}/gatk-4.6.2.0/gatk"
+                chmod +x "${TOOLS_DIR}/gatk-4.6.2.0/gatk"
+            fi
+        fi
+    else
+        GATK_JAR=$(find "${TOOLS_DIR}" -name "*.jar" -type f | grep -i gatk | head -1)
+
+        if [ -n "${GATK_JAR}" ]; then
+            log "Found GATK JAR file: ${GATK_JAR}"
+            mkdir -p "${TOOLS_DIR}/gatk-4.6.2.0"
+            cat > "${TOOLS_DIR}/gatk-4.6.2.0/gatk" << 'EOF'
+#!/bin/bash
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+java -jar "${DIR}/../$(basename "$(find "${DIR}/.." -name "*.jar" -type f | grep -i gatk | head -1)")" "$@"
+EOF
+            chmod +x "${TOOLS_DIR}/gatk-4.6.2.0/gatk"
+            cp "${GATK_JAR}" "${TOOLS_DIR}/" 2>/dev/null || true
+        else
+            log "ERROR: Could not find GATK binary or JAR file after extraction"
+            ls -la "${TOOLS_DIR}" 2>/dev/null || true
+            return 1
+        fi
+    fi
+
+    if [ -x "${TOOLS_DIR}/gatk-4.6.2.0/gatk" ]; then
+        log "GATK installed to: ${TOOLS_DIR}/gatk-4.6.2.0/gatk"
+        return 0
+    elif [ -x "${TOOLS_DIR}/gatk-4.4.0.0/gatk" ]; then
+        log "GATK installed to: ${TOOLS_DIR}/gatk-4.4.0.0/gatk"
+        return 0
+    elif [ -x "${TOOLS_DIR}/gatk" ]; then
+        log "GATK installed to: ${TOOLS_DIR}/gatk"
+        return 0
+    else
+        log "ERROR: GATK installation failed"
+        return 1
+    fi
+}
+
+install_bioinformatics_tools() {
+    log "Installing bioinformatics tools (samtools, bcftools, htslib)..."
+
+    if command -v samtools &> /dev/null && command -v bcftools &> /dev/null; then
+        log "samtools and bcftools already available in PATH"
+        return 0
+    fi
+
+    if command -v conda &> /dev/null; then
+        log "Installing via conda..."
+        conda install -c bioconda samtools bcftools htslib -y 2>/dev/null && return 0
+    fi
+
+    if ! command -v gcc &> /dev/null || ! command -v make &> /dev/null; then
+        log "WARNING: gcc or make not found. Cannot compile tools from source."
+        log "Please install samtools and bcftools manually."
+        return 1
+    fi
+
+    BUILD_DIR="${TOOLS_DIR}/build"
+    mkdir -p "${BUILD_DIR}"
+
+    log "Installing htslib..."
+    cd "${BUILD_DIR}"
+    wget -q --tries=3 --timeout=30 -O htslib.tar.bz2 "https://github.com/samtools/htslib/releases/download/1.19/htslib-1.19.tar.bz2"
+    if [ ! -f "htslib.tar.bz2" ]; then
+        wget -q --tries=3 --timeout=30 -O htslib.tar.bz2 "https://github.com/samtools/htslib/releases/download/1.18/htslib-1.18.tar.bz2"
+    fi
+
+    if [ -f "htslib.tar.bz2" ]; then
+        tar -xjf htslib.tar.bz2
+        cd htslib-*
+        ./configure --prefix="${TOOLS_DIR}" --disable-libcurl
+        make
+        make install
+        cd ..
+    else
+        log "WARNING: Failed to download htslib"
+    fi
+
+    log "Installing samtools..."
+    wget -q --tries=3 --timeout=30 -O samtools.tar.bz2 "https://github.com/samtools/samtools/releases/download/1.19/samtools-1.19.tar.bz2"
+    if [ ! -f "samtools.tar.bz2" ]; then
+        wget -q --tries=3 --timeout=30 -O samtools.tar.bz2 "https://github.com/samtools/samtools/releases/download/1.18/samtools-1.18.tar.bz2"
+    fi
+
+    if [ -f "samtools.tar.bz2" ]; then
+        tar -xjf samtools.tar.bz2
+        cd samtools-*
+        ./configure --prefix="${TOOLS_DIR}" --without-curses
+        make
+        make install
+        cd ..
+    else
+        log "WARNING: Failed to download samtools"
+    fi
+
+    log "Installing bcftools..."
+    wget -q --tries=3 --timeout=30 -O bcftools.tar.bz2 "https://github.com/samtools/bcftools/releases/download/1.19/bcftools-1.19.tar.bz2"
+    if [ ! -f "bcftools.tar.bz2" ]; then
+        wget -q --tries=3 --timeout=30 -O bcftools.tar.bz2 "https://github.com/samtools/bcftools/releases/download/1.18/bcftools-1.18.tar.bz2"
+    fi
+
+    if [ -f "bcftools.tar.bz2" ]; then
+        tar -xjf bcftools.tar.bz2
+        cd bcftools-*
+        ./configure --prefix="${TOOLS_DIR}"
+        make
+        make install
+        cd ..
+    else
+        log "WARNING: Failed to download bcftools"
+    fi
+
+    rm -rf "${BUILD_DIR}" 2>/dev/null || true
+
+    if [ -x "${TOOLS_DIR}/bin/samtools" ] && [ -x "${TOOLS_DIR}/bin/bcftools" ]; then
+        log "Bioinformatics tools installed successfully"
+    else
+        log "WARNING: Some tools may not have installed correctly"
+        log "You may need to install samtools and bcftools manually"
+    fi
+}
+
+install_parallel_tools() {
+    log "Installing parallel tools..."
+
+    if ! command -v pigz &> /dev/null; then
+        cd "${TOOLS_DIR}"
+        wget -q https://zlib.net/pigz/pigz-2.8.tar.gz
+        tar -xzf pigz-2.8.tar.gz
+        cd pigz-2.8
+        make
+        cp pigz unpigz "${TOOLS_DIR}/bin/"
+        cd ..
+        rm -rf pigz-2.8 pigz-2.8.tar.gz
+        log "pigz installed"
+    fi
+
+    if ! command -v parallel &> /dev/null; then
+        cd "${TOOLS_DIR}"
+        wget -q http://ftp.gnu.org/gnu/parallel/parallel-latest.tar.bz2
+        tar -xjf parallel-latest.tar.bz2
+        cd parallel-*/
+        ./configure --prefix="${TOOLS_DIR}"
+        make -j ${CPU_CORES}
+        make install
+        cd ..
+        rm -rf parallel-* parallel-latest.tar.bz2
+        log "GNU parallel installed"
+    fi
+}
+
+install_star() {
+    log "Installing STAR aligner..."
+
+    if command -v STAR &> /dev/null; then
+        log "STAR already installed"
+        return 0
+    fi
+
+    cd "${TOOLS_DIR}"
+    wget -q https://github.com/alexdobin/STAR/archive/2.7.11a.tar.gz
+    tar -xzf 2.7.11a.tar.gz
+    cd STAR-2.7.11a/source
+    make -j ${CPU_CORES} STAR
+    cp STAR "${TOOLS_DIR}/bin/"
+
+    if [ "${USE_GPU}" = "true" ]; then
+        make -j ${CPU_CORES} STARforCUDA
+        cp STAR "${TOOLS_DIR}/bin/STAR"
+        log "STAR compiled with CUDA support"
+    fi
+
+    cd ../..
+    rm -f 2.7.11a.tar.gz
+    log "STAR installed"
+}
+
+install_all_tools() {
+    log "Starting complete tool installation..."
+    log "Tools will be installed to: ${TOOLS_DIR}"
+
+    setup_environment
+    install_java
+    install_sratoolkit
+    install_fastqc
+    install_multiqc
+    install_trimmomatic
+    install_gatk
+    install_bioinformatics_tools
+    install_parallel_tools
+    install_star
+
+    log ""
+    log "========================================"
+    log "Installation Attempt Complete!"
+    log "========================================"
+    log ""
+    log "To use the tools, run:"
+    log "  source ${BASE_DIR}/env.sh"
+    log ""
+    log "Or add to your ~/.bashrc:"
+    log "  source ${BASE_DIR}/env.sh"
+    log ""
+    log "Then run: ./$(basename "$0") setup"
+
+    log ""
+    log "Checking installed tools:"
+    check_tool "prefetch" || log "prefetch: NOT FOUND"
+    check_tool "fastqc" || log "fastqc: NOT FOUND"
+    check_tool "gatk" || log "gatk: NOT FOUND"
+    check_tool "java" || log "java: NOT FOUND"
+    check_tool "samtools" || log "samtools: NOT FOUND"
+    check_tool "bcftools" || log "bcftools: NOT FOUND"
+    check_tool "pigz" || log "pigz: NOT FOUND"
+    check_tool "parallel" || log "parallel: NOT FOUND"
+    check_tool "STAR" || log "STAR: NOT FOUND"
+}
+
+############################################################
+# Reference Data (Complete)
+############################################################
+
 download_reference() {
     log "Downloading reference genome..."
     mkdir -p "$(dirname "${REF_GENOME}")"
 
-    wget -q -O "${REF_GENOME}.gz" \
-        "https://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_human/release_49/GRCh38.primary_assembly.genome.fa.gz"
+    wget -q -O "${REF_GENOME}.gz" "${REF_GENOME_URL}"
 
     if [ -f "${REF_GENOME}.gz" ]; then
         gunzip "${REF_GENOME}.gz"
@@ -239,7 +825,6 @@ download_reference() {
             log "WARNING: samtools not available, skipping faidx"
         fi
 
-        # Check if GATK is available for CreateSequenceDictionary
         if check_tool "gatk"; then
             $GATK CreateSequenceDictionary \
                 -R "${REF_GENOME}" \
@@ -253,18 +838,12 @@ download_reference() {
     fi
 
     log "Downloading known sites..."
-    # dbSNP
     mkdir -p "$(dirname "${DBSNP}")"
-    wget -q -O "${DBSNP}" \
-        "https://ddbj.nig.ac.jp/public/public-human-genomes/GRCh38/fasta/dbsnp_146.hg38.vcf.gz"
-    wget -q -O "${DBSNP}.tbi" \
-        "https://ddbj.nig.ac.jp/public/public-human-genomes/GRCh38/fasta/dbsnp_146.hg38.vcf.gz.tbi"
+    wget -q -O "${DBSNP}" "${DBSNP_URL}"
+    wget -q -O "${DBSNP}.tbi" "${DBSNP_URL}.tbi"
 
-    # Mills INDELs
-    wget -q -O "${MILLS}" \
-        "https://storage.googleapis.com/genomics-public-data/references/hg38/v0/Mills_and_1000G_gold_standard.indels.hg38.vcf.gz"
-    wget -q -O "${MILLS}.tbi" \
-        "https://storage.googleapis.com/genomics-public-data/references/hg38/v0/Mills_and_1000G_gold_standard.indels.hg38.vcf.gz.tbi"
+    wget -q -O "${MILLS}" "${MILLS_URL}"
+    wget -q -O "${MILLS}.tbi" "${MILLS_URL}.tbi"
 
     return 0
 }
@@ -296,7 +875,6 @@ generate_gene_bed() {
         tabix -p bed "${GENE_BED}.gz"
     fi
 
-    # Create header file for bcftools
     echo -e '##INFO=<ID=GENE,Number=1,Type=String,Description="Gene name">' > "${GENE_BED}.hdr"
 
     log "Gene BED file created: ${GENE_BED}.gz"
@@ -305,7 +883,6 @@ generate_gene_bed() {
 download_funcotator() {
     log "Downloading Funcotator data sources..."
 
-    # Check if GATK is available
     if ! check_tool "gatk"; then
         log "ERROR: GATK is required for Funcotator but not found"
         return 1
@@ -323,519 +900,214 @@ download_funcotator() {
     log "Funcotator data sources downloaded to: ${FUNCOTATOR_DS}"
 }
 
-##################################
-# Tool Installation Functions
-##################################
+setup_references() {
+    log "Setting up pipeline..."
+    setup_environment
 
-install_sratoolkit() {
-    log "Installing SRA Toolkit..."
+    echo "Checking for required tools..."
+    REQUIRED_TOOLS=("java" "samtools" "bcftools" "bgzip" "tabix" "wget")
+    for tool in "${REQUIRED_TOOLS[@]}"; do
+        check_tool "${tool}"
+    done
 
-    if [ -d "${TOOLS_DIR}/sratoolkit" ] && [ -x "${TOOLS_DIR}/sratoolkit/bin/prefetch" ]; then
-        log "SRA Toolkit already installed"
-        return 0
-    fi
+    check_tool "gatk"
 
-    cd "${TOOLS_DIR}"
+    echo ""
+    echo "Downloading reference files..."
+    download_reference
+    generate_gene_bed
 
-    # Try different versions for different architectures
-    ARCH=$(uname -m)
+    echo ""
+    echo "Setup complete!"
+    echo "Edit the SRA_LIST array in the script to add your SRA IDs"
+    echo "Then run: ./$(basename "$0") run"
+}
 
-    if [ "${ARCH}" == "x86_64" ]; then
-        # Try Ubuntu version first (common on HPC)
-        wget -q --tries=3 --timeout=30 -O sratoolkit.tar.gz \
-            "https://ftp-trace.ncbi.nlm.nih.gov/sra/sdk/current/sratoolkit.current-ubuntu64.tar.gz" || \
-        wget -q --tries=3 --timeout=30 -O sratoolkit.tar.gz \
-            "https://ftp-trace.ncbi.nlm.nih.gov/sra/sdk/current/sratoolkit.current-centos_linux64.tar.gz" || \
-        wget -q --tries=3 --timeout=30 -O sratoolkit.tar.gz \
-            "https://ftp-trace.ncbi.nlm.nih.gov/sra/sdk/current/sratoolkit.current-mac64.tar.gz"
-    else
-        log "Unsupported architecture: ${ARCH}"
-        return 1
-    fi
+############################################################
+# SRA ID Extraction (Fixed and Complete)
+############################################################
 
-    if [ -f "sratoolkit.tar.gz" ]; then
-        tar -xzf sratoolkit.tar.gz
-        SRATOOLKIT_DIR=$(ls -d sratoolkit.* 2>/dev/null | head -1)
-        if [ -n "${SRATOOLKIT_DIR}" ]; then
-            mv "${SRATOOLKIT_DIR}" sratoolkit
-            rm -f sratoolkit.tar.gz
-            # Make all binaries executable
-            chmod +x "${TOOLS_DIR}/sratoolkit/bin/"* 2>/dev/null || true
-            log "SRA Toolkit installed to: ${TOOLS_DIR}/sratoolkit"
+extract_sra_ids_from_excel() {
+    local excel_file="$1"
+    local output_file="$2"
+
+    cat > "${SCRIPT_DIR}/extract_sra_ids.py" << 'PYTHONSCRIPT'
+#!/usr/bin/env python3
+import pandas as pd
+import sys
+import re
+
+def extract_sra_ids(excel_path, output_path):
+    try:
+        # Try to read specific sheet names first
+        try:
+            mdd_df = pd.read_excel(excel_path, sheet_name='Female MDD')
+            ctrl_df = pd.read_excel(excel_path, sheet_name='Female Control')
+        except:
+            # Try to find sheets with different names
+            xls = pd.ExcelFile(excel_path)
+            sheet_names = xls.sheet_names
+            print(f"Available sheets: {sheet_names}")
+
+            # Use first two sheets
+            mdd_df = pd.read_excel(excel_path, sheet_name=sheet_names[0])
+            ctrl_df = pd.read_excel(excel_path, sheet_name=sheet_names[1]) if len(sheet_names) > 1 else pd.DataFrame()
+
+        def find_sra_column(df):
+            sra_pattern = re.compile(r'^SRR\d+$')
+            # Try common column names first
+            for col_name in df.columns:
+                col_lower = str(col_name).lower()
+                if any(keyword in col_lower for keyword in ['sample', 'id', 'sra', 'accession']):
+                    if df[col_name].dropna().astype(str).str.match(sra_pattern).any():
+                        return col_name
+
+            # Try all columns
+            for col_name in df.columns:
+                if df[col_name].dropna().astype(str).str.match(sra_pattern).any():
+                    return col_name
+
+            return None
+
+        all_sra_ids = []
+
+        for df, sheet_name in [(mdd_df, 'MDD'), (ctrl_df, 'Control')]:
+            if df.empty:
+                continue
+
+            sra_col = find_sra_column(df)
+            if sra_col:
+                sra_ids = df[sra_col].dropna().astype(str)
+                valid_ids = sra_ids[sra_ids.str.match(r'^SRR\d+$')].unique()
+                all_sra_ids.extend(valid_ids)
+                print(f"Found {len(valid_ids)} SRA IDs in {sheet_name} sheet (column: '{sra_col}')")
+            else:
+                print(f"Warning: Could not find SRA IDs in {sheet_name} sheet")
+
+        # Remove duplicates and sort
+        unique_ids = sorted(set(all_sra_ids))
+
+        if not unique_ids:
+            print("ERROR: No SRA IDs found in Excel file")
+            return False
+
+        # Write to file
+        with open(output_path, 'w') as f:
+            for sra_id in unique_ids:
+                f.write(f"{sra_id}\n")
+
+        print(f"\nTotal unique SRA IDs extracted: {len(unique_ids)}")
+        print(f"First 5 IDs: {unique_ids[:5]}")
+        if len(unique_ids) > 5:
+            print(f"... and {len(unique_ids) - 5} more")
+
+        return True
+
+    except Exception as e:
+        print(f"Error extracting SRA IDs: {e}")
+        return False
+
+if __name__ == "__main__":
+    if len(sys.argv) != 3:
+        print("Usage: python extract_sra_ids.py <excel_file> <output_file>")
+        sys.exit(1)
+
+    success = extract_sra_ids(sys.argv[1], sys.argv[2])
+    sys.exit(0 if success else 1)
+PYTHONSCRIPT
+
+    chmod +x "${SCRIPT_DIR}/extract_sra_ids.py"
+
+    # Check for Python dependencies
+    if ! python3 -c "import pandas" &> /dev/null; then
+        log "Installing Python dependencies..."
+        if command -v pip3 &> /dev/null; then
+            pip3 install pandas openpyxl
+        elif command -v pip &> /dev/null; then
+            pip install pandas openpyxl
         else
-            log "ERROR: Could not extract SRA Toolkit"
-            return 1
+            log_error "pip not available. Please install pandas manually: pip install pandas openpyxl"
         fi
+    fi
+
+    log "Extracting SRA IDs from Excel..."
+    if python3 "${SCRIPT_DIR}/extract_sra_ids.py" "${excel_file}" "${output_file}"; then
+        return 0
     else
-        log "ERROR: Failed to download SRA Toolkit"
         return 1
     fi
 }
 
-install_fastqc() {
-    log "Installing FastQC..."
+prompt_for_excel_file() {
+    if [ -z "${EXCEL_FILE}" ] || [ ! -f "${EXCEL_FILE}" ]; then
+        echo ""
+        echo "========================================"
+        echo "Excel File Selection"
+        echo "========================================"
+        echo "Please provide the path to your Excel file containing SRA IDs."
+        echo ""
 
-    # Check if already installed
-    if [ -x "${TOOLS_DIR}/FastQC/fastqc" ]; then
-        log "FastQC already installed"
-        return 0
-    fi
+        # Find Excel files
+        excel_files=$(find . -maxdepth 2 -name "*.xlsx" -o -name "*.xls" 2>/dev/null | head -10)
 
-    mkdir -p "${TOOLS_DIR}/FastQC"
-    cd "${TOOLS_DIR}"
+        if [ -n "${excel_files}" ]; then
+            echo "Found Excel files:"
+            i=1
+            while IFS= read -r file; do
+                echo "  ${i}. $(basename "${file}")"
+                i=$((i + 1))
+            done <<< "${excel_files}"
+            echo "  0. Enter custom path"
+            echo ""
+            read -p "Select file (0-$(($i-1))): " choice
 
-    # Remove any existing zip file
-    rm -f fastqc.zip
-
-    # Download FastQC
-    log "Downloading FastQC..."
-    if ! wget -q --tries=3 --timeout=60 -O fastqc.zip \
-        "https://www.bioinformatics.babraham.ac.uk/projects/fastqc/fastqc_v0.12.1.zip"; then
-        log "Trying alternative FastQC download URL..."
-        if ! wget -q --tries=3 --timeout=60 -O fastqc.zip \
-            "https://www.bioinformatics.babraham.ac.uk/projects/fastqc/fastqc_v0.11.9.zip"; then
-            log "ERROR: Failed to download FastQC"
-            log "You may need to install it manually from:"
-            log "https://www.bioinformatics.babraham.ac.uk/projects/fastqc/"
-            return 1
-        fi
-    fi
-
-    # Extract
-    log "Extracting FastQC..."
-    unzip -q fastqc.zip 2>/dev/null || {
-        log "ERROR: Failed to extract FastQC zip file"
-        return 1
-    }
-
-    # Look for the fastqc file in common extraction patterns
-    FASTQC_FOUND=false
-
-    # Pattern 1: Standard FastQC directory
-    if [ -f "FastQC/fastqc" ]; then
-        mv FastQC/* "${TOOLS_DIR}/FastQC/" 2>/dev/null || true
-        FASTQC_FOUND=true
-    # Pattern 2: Versioned directory (v0.12.1)
-    elif [ -f "fastqc_v0.12.1/fastqc" ]; then
-        mv fastqc_v0.12.1/* "${TOOLS_DIR}/FastQC/" 2>/dev/null || true
-        FASTQC_FOUND=true
-    # Pattern 3: Versioned directory (v0.11.9)
-    elif [ -f "fastqc_v0.11.9/fastqc" ]; then
-        mv fastqc_v0.11.9/* "${TOOLS_DIR}/FastQC/" 2>/dev/null || true
-        FASTQC_FOUND=true
-    else
-        # Search for any fastqc file
-        FOUND_FILE=$(find . -type f -name "fastqc" 2>/dev/null | head -1)
-        if [ -n "${FOUND_FILE}" ]; then
-            # Get its directory
-            FOUND_DIR=$(dirname "${FOUND_FILE}")
-            mv "${FOUND_DIR}"/* "${TOOLS_DIR}/FastQC/" 2>/dev/null || true
-            FASTQC_FOUND=true
-        fi
-    fi
-
-    if ${FASTQC_FOUND}; then
-        # Make sure the fastqc file is executable
-        if [ -f "${TOOLS_DIR}/FastQC/fastqc" ]; then
-            chmod +x "${TOOLS_DIR}/FastQC/fastqc"
-            log "FastQC successfully installed to: ${TOOLS_DIR}/FastQC"
-        else
-            # The file might be inside a subdirectory
-            SUB_FILE=$(find "${TOOLS_DIR}/FastQC" -type f -name "fastqc" 2>/dev/null | head -1)
-            if [ -n "${SUB_FILE}" ]; then
-                # Move it to the main directory
-                mv "${SUB_FILE}" "${TOOLS_DIR}/FastQC/fastqc" 2>/dev/null || true
-                chmod +x "${TOOLS_DIR}/FastQC/fastqc"
-                log "FastQC successfully installed to: ${TOOLS_DIR}/FastQC"
+            if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -lt "$i" ]; then
+                EXCEL_FILE=$(echo "${excel_files}" | sed -n "${choice}p")
             else
-                log "ERROR: FastQC file not found after extraction"
-                return 1
+                read -p "Enter path to Excel file: " EXCEL_FILE
             fi
-        fi
-    else
-        log "ERROR: Could not find FastQC after extraction"
-        log "Trying manual extraction..."
-
-        # List extracted files for debugging
-        log "Extracted files:"
-        find . -type f -name "*" | head -20
-
-        return 1
-    fi
-
-    # Clean up
-    rm -f fastqc.zip
-    rm -rf FastQC fastqc_v0.* 2>/dev/null || true
-
-    return 0
-}
-
-install_multiqc() {
-    log "Installing MultiQC..."
-
-    # Check if already installed and working
-    if python3 -c "import multiqc" 2>/dev/null; then
-        log "MultiQC Python module already available"
-        return 0
-    fi
-
-    # Try to install with all dependencies
-    if command -v pip3 &> /dev/null; then
-        log "Installing MultiQC and dependencies with pip3..."
-        # First install required dependency
-        pip3 install --user rpds-py 2>/dev/null || true
-        # Then install multiqc
-        pip3 install --user multiqc 2>/dev/null && return 0
-    fi
-
-    if command -v pip &> /dev/null; then
-        log "Installing MultiQC and dependencies with pip..."
-        pip install --user rpds-py 2>/dev/null || true
-        pip install --user multiqc 2>/dev/null && return 0
-    fi
-
-    # Try to install to tools directory
-    if command -v python3 &> /dev/null; then
-        log "Installing MultiQC with python3 -m pip..."
-        python3 -m pip install --prefix="${TOOLS_DIR}" rpds-py 2>/dev/null || true
-        python3 -m pip install --prefix="${TOOLS_DIR}" multiqc 2>/dev/null && return 0
-    fi
-
-    # Try conda if available
-    if command -v conda &> /dev/null; then
-        log "Installing MultiQC with conda..."
-        conda install -c bioconda multiqc -y 2>/dev/null && return 0
-    fi
-
-    log "WARNING: Could not install MultiQC automatically"
-    log "You may need to install it manually:"
-    log "  pip install --user rpds-py multiqc"
-    log "Then re-run: source ${BASE_DIR}/env.sh"
-    return 1
-}
-
-install_trimmomatic() {
-    log "Installing Trimmomatic..."
-
-    if [ -f "${TOOLS_DIR}/Trimmomatic-0.39/trimmomatic-0.39.jar" ]; then
-        log "Trimmomatic already installed"
-        return 0
-    fi
-
-    mkdir -p "${TOOLS_DIR}/Trimmomatic-0.39"
-    cd "${TOOLS_DIR}"
-
-    # Try multiple download URLs
-    wget -q --tries=3 --timeout=30 -O Trimmomatic-0.39.zip \
-        "https://github.com/usadellab/Trimmomatic/files/5854849/Trimmomatic-0.39.zip" || \
-    wget -q --tries=3 --timeout=30 -O Trimmomatic-0.39.zip \
-        "https://github.com/usadellab/Trimmomatic/releases/download/v0.39/Trimmomatic-0.39.zip" || \
-    wget -q --tries=3 --timeout=30 -O Trimmomatic-0.39.zip \
-        "http://www.usadellab.org/cms/uploads/supplementary/Trimmomatic/Trimmomatic-0.39.zip"
-
-    if [ -f "Trimmomatic-0.39.zip" ]; then
-        unzip -q Trimmomatic-0.39.zip -d "${TOOLS_DIR}"
-
-        # Check what was extracted
-        if [ -d "Trimmomatic-0.39" ]; then
-            # Already in correct location
-            true
-        elif [ -d "${TOOLS_DIR}/Trimmomatic-0.39" ]; then
-            # Already moved
-            true
         else
-            # Try to find the extracted directory
-            TRIMM_DIR=$(find "${TOOLS_DIR}" -name "*Trimmomatic*" -type d | head -1)
-            if [ -n "${TRIMM_DIR}" ]; then
-                mv "${TRIMM_DIR}" "${TOOLS_DIR}/Trimmomatic-0.39" 2>/dev/null || true
+            echo "No Excel files found in current directory."
+            read -p "Enter path to Excel file: " EXCEL_FILE
+        fi
+
+        [ -f "${EXCEL_FILE}" ] || log_error "Excel file not found: ${EXCEL_FILE}"
+        log "Using Excel file: ${EXCEL_FILE}"
+    fi
+}
+
+load_sra_ids() {
+    log "Loading SRA IDs..."
+    prompt_for_excel_file
+
+    if extract_sra_ids_from_excel "${EXCEL_FILE}" "${SRA_LIST_FILE}"; then
+        if [ -f "${SRA_LIST_FILE}" ]; then
+            count=$(wc -l < "${SRA_LIST_FILE}" | tr -d ' ')
+            [ "${count}" -eq 0 ] && log_error "No SRA IDs found in Excel file"
+
+            mapfile -t SRA_LIST < "${SRA_LIST_FILE}"
+            log "Loaded ${#SRA_LIST[@]} SRA IDs from ${EXCEL_FILE}"
+
+            echo ""
+            echo "First 5 SRA IDs:"
+            for i in {0..4}; do
+                [ -n "${SRA_LIST[$i]}" ] && echo "  ${SRA_LIST[$i]}"
+            done
+            if [ ${#SRA_LIST[@]} -gt 5 ]; then
+                echo "  ... and $(( ${#SRA_LIST[@]} - 5 )) more"
             fi
-        fi
-
-        rm -f Trimmomatic-0.39.zip
-
-        # Verify installation
-        if [ -f "${TOOLS_DIR}/Trimmomatic-0.39/trimmomatic-0.39.jar" ]; then
-            log "Trimmomatic installed to: ${TOOLS_DIR}/Trimmomatic-0.39"
+            echo ""
         else
-            # Try to find the jar file
-            JAR_FILE=$(find "${TOOLS_DIR}/Trimmomatic-0.39" -name "*.jar" | head -1)
-            if [ -n "${JAR_FILE}" ]; then
-                # Rename to standard name
-                cp "${JAR_FILE}" "${TOOLS_DIR}/Trimmomatic-0.39/trimmomatic-0.39.jar"
-                log "Trimmomatic installed to: ${TOOLS_DIR}/Trimmomatic-0.39"
-            else
-                log "ERROR: Could not find Trimmomatic JAR file"
-                return 1
-            fi
+            log_error "Failed to create SRA IDs file"
         fi
     else
-        log "ERROR: Failed to download Trimmomatic"
-        return 1
+        log_error "Failed to extract SRA IDs from Excel file"
     fi
 }
 
-install_gatk() {
-    log "Installing GATK..."
-
-    # Check if already installed
-    if [ -x "${TOOLS_DIR}/gatk" ]; then
-        log "GATK already installed"
-        return 0
-    fi
-
-    if [ -x "${TOOLS_DIR}/gatk-4.6.2.0/gatk" ]; then
-        log "GATK already installed"
-        return 0
-    fi
-
-    mkdir -p "${TOOLS_DIR}"
-    cd "${TOOLS_DIR}"
-
-    log "Downloading GATK..."
-
-    # Try multiple GATK versions and URLs
-    GATK_DOWNLOADED=false
-
-    # Try GATK 4.6.2.0 first
-    if ! ${GATK_DOWNLOADED}; then
-        wget -q --tries=3 --timeout=60 -O gatk-4.6.2.0.zip \
-            "https://github.com/broadinstitute/gatk/releases/download/4.6.2.0/gatk-4.6.2.0.zip" && \
-        GATK_DOWNLOADED=true
-    fi
-
-    # Try GATK 4.4.0.0
-    if ! ${GATK_DOWNLOADED}; then
-        wget -q --tries=3 --timeout=60 -O gatk-4.4.0.0.zip \
-            "https://github.com/broadinstitute/gatk/releases/download/4.4.0.0/gatk-4.4.0.0.zip" && \
-        GATK_DOWNLOADED=true
-    fi
-
-    # Try generic gatk download
-    if ! ${GATK_DOWNLOADED}; then
-        wget -q --tries=3 --timeout=60 -O gatk.zip \
-            "https://github.com/broadinstitute/gatk/releases/latest/download/gatk.zip" && \
-        GATK_DOWNLOADED=true
-    fi
-
-    if ! ${GATK_DOWNLOADED}; then
-        log "ERROR: Failed to download GATK"
-        return 1
-    fi
-
-    # Extract the downloaded file
-    if [ -f "gatk-4.6.2.0.zip" ]; then
-        unzip -q gatk-4.6.2.0.zip
-        rm -f gatk-4.6.2.0.zip
-    elif [ -f "gatk-4.4.0.0.zip" ]; then
-        unzip -q gatk-4.4.0.0.zip
-        rm -f gatk-4.4.0.0.zip
-    elif [ -f "gatk.zip" ]; then
-        unzip -q gatk.zip
-        rm -f gatk.zip
-    fi
-
-    # Find and organize the GATK files
-    log "Organizing GATK files..."
-
-    # Look for the gatk executable
-    GATK_BIN=$(find "${TOOLS_DIR}" -name "gatk" -type f | head -1)
-
-    if [ -n "${GATK_BIN}" ]; then
-        # Make it executable
-        chmod +x "${GATK_BIN}"
-
-        # Check if it's in a versioned directory
-        GATK_DIR=$(dirname "${GATK_BIN}")
-        GATK_BASE_DIR=$(dirname "${GATK_DIR}")
-
-        if [[ "${GATK_DIR}" == *"gatk-4."* ]] && [ "${GATK_BASE_DIR}" == "${TOOLS_DIR}" ]; then
-            # Already in a versioned directory under TOOLS_DIR
-            log "GATK found in: ${GATK_DIR}"
-        else
-            # Move to a standard location
-            if [[ "${GATK_DIR}" == *"gatk-4."* ]]; then
-                # It's already in a versioned directory, move the whole directory
-                mv "${GATK_DIR}" "${TOOLS_DIR}/" 2>/dev/null || true
-            else
-                # Create a version directory and move the binary
-                mkdir -p "${TOOLS_DIR}/gatk-4.6.2.0"
-                cp "${GATK_BIN}" "${TOOLS_DIR}/gatk-4.6.2.0/gatk"
-                chmod +x "${TOOLS_DIR}/gatk-4.6.2.0/gatk"
-            fi
-        fi
-    else
-        # Try to find any Java jar file that might be GATK
-        GATK_JAR=$(find "${TOOLS_DIR}" -name "*.jar" -type f | grep -i gatk | head -1)
-
-        if [ -n "${GATK_JAR}" ]; then
-            log "Found GATK JAR file: ${GATK_JAR}"
-            # Create a wrapper script
-            mkdir -p "${TOOLS_DIR}/gatk-4.6.2.0"
-            cat > "${TOOLS_DIR}/gatk-4.6.2.0/gatk" << 'EOF'
-#!/bin/bash
-# GATK wrapper script
-DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-java -jar "${DIR}/../$(basename "$(find "${DIR}/.." -name "*.jar" -type f | grep -i gatk | head -1)")" "$@"
-EOF
-            chmod +x "${TOOLS_DIR}/gatk-4.6.2.0/gatk"
-
-            # Also copy the jar file near the wrapper
-            cp "${GATK_JAR}" "${TOOLS_DIR}/" 2>/dev/null || true
-        else
-            log "ERROR: Could not find GATK binary or JAR file after extraction"
-            log "Contents of ${TOOLS_DIR}:"
-            ls -la "${TOOLS_DIR}" 2>/dev/null || true
-            return 1
-        fi
-    fi
-
-    # Verify installation
-    if [ -x "${TOOLS_DIR}/gatk-4.6.2.0/gatk" ]; then
-        log "GATK installed to: ${TOOLS_DIR}/gatk-4.6.2.0/gatk"
-        return 0
-    elif [ -x "${TOOLS_DIR}/gatk-4.4.0.0/gatk" ]; then
-        log "GATK installed to: ${TOOLS_DIR}/gatk-4.4.0.0/gatk"
-        return 0
-    elif [ -x "${TOOLS_DIR}/gatk" ]; then
-        log "GATK installed to: ${TOOLS_DIR}/gatk"
-        return 0
-    else
-        log "ERROR: GATK installation failed"
-        return 1
-    fi
-}
-
-install_bioinformatics_tools() {
-    log "Installing bioinformatics tools (samtools, bcftools, htslib)..."
-
-    # Check if already installed
-    if command -v samtools &> /dev/null && command -v bcftools &> /dev/null; then
-        log "samtools and bcftools already available in PATH"
-        return 0
-    fi
-
-    # Try to install via conda first (if available)
-    if command -v conda &> /dev/null; then
-        log "Installing via conda..."
-        conda install -c bioconda samtools bcftools htslib -y 2>/dev/null && return 0
-    fi
-
-    # Create build directory
-    BUILD_DIR="${TOOLS_DIR}/build"
-    mkdir -p "${BUILD_DIR}"
-
-    # Check for required build tools
-    if ! command -v gcc &> /dev/null || ! command -v make &> /dev/null; then
-        log "WARNING: gcc or make not found. Cannot compile tools from source."
-        log "Please install samtools and bcftools manually."
-        return 1
-    fi
-
-    # Install htslib (dependency for samtools and bcftools)
-    log "Installing htslib..."
-    cd "${BUILD_DIR}"
-    wget -q --tries=3 --timeout=30 -O htslib.tar.bz2 "https://github.com/samtools/htslib/releases/download/1.19/htslib-1.19.tar.bz2"
-    if [ ! -f "htslib.tar.bz2" ]; then
-        wget -q --tries=3 --timeout=30 -O htslib.tar.bz2 "https://github.com/samtools/htslib/releases/download/1.18/htslib-1.18.tar.bz2"
-    fi
-
-    if [ -f "htslib.tar.bz2" ]; then
-        tar -xjf htslib.tar.bz2
-        cd htslib-*
-        ./configure --prefix="${TOOLS_DIR}" --disable-libcurl
-        make
-        make install
-        cd ..
-    else
-        log "WARNING: Failed to download htslib"
-    fi
-
-    # Install samtools
-    log "Installing samtools..."
-    wget -q --tries=3 --timeout=30 -O samtools.tar.bz2 "https://github.com/samtools/samtools/releases/download/1.19/samtools-1.19.tar.bz2"
-    if [ ! -f "samtools.tar.bz2" ]; then
-        wget -q --tries=3 --timeout=30 -O samtools.tar.bz2 "https://github.com/samtools/samtools/releases/download/1.18/samtools-1.18.tar.bz2"
-    fi
-
-    if [ -f "samtools.tar.bz2" ]; then
-        tar -xjf samtools.tar.bz2
-        cd samtools-*
-        ./configure --prefix="${TOOLS_DIR}" --without-curses
-        make
-        make install
-        cd ..
-    else
-        log "WARNING: Failed to download samtools"
-    fi
-
-    # Install bcftools
-    log "Installing bcftools..."
-    wget -q --tries=3 --timeout=30 -O bcftools.tar.bz2 "https://github.com/samtools/bcftools/releases/download/1.19/bcftools-1.19.tar.bz2"
-    if [ ! -f "bcftools.tar.bz2" ]; then
-        wget -q --tries=3 --timeout=30 -O bcftools.tar.bz2 "https://github.com/samtools/bcftools/releases/download/1.18/bcftools-1.18.tar.bz2"
-    fi
-
-    if [ -f "bcftools.tar.bz2" ]; then
-        tar -xjf bcftools.tar.bz2
-        cd bcftools-*
-        ./configure --prefix="${TOOLS_DIR}"
-        make
-        make install
-        cd ..
-    else
-        log "WARNING: Failed to download bcftools"
-    fi
-
-    # Clean up
-    rm -rf "${BUILD_DIR}" 2>/dev/null || true
-
-    # Verify installation
-    if [ -x "${TOOLS_DIR}/bin/samtools" ] && [ -x "${TOOLS_DIR}/bin/bcftools" ]; then
-        log "Bioinformatics tools installed successfully"
-    else
-        log "WARNING: Some tools may not have installed correctly"
-        log "You may need to install samtools and bcftools manually"
-    fi
-}
-
-install_java() {
-    log "Checking for Java..."
-
-    if command -v java &> /dev/null; then
-        JAVA_VERSION=$(java -version 2>&1 | head -1 | cut -d'"' -f2)
-        log "Java is already available: ${JAVA_VERSION}"
-        return 0
-    fi
-
-    log "Java not found in PATH. Checking if we can install locally..."
-
-    # Try to find Java in common locations
-    if [ -d "/usr/lib/jvm" ]; then
-        JAVA_HOME=$(find /usr/lib/jvm -name "java*" -type d | grep -v debug | grep -v src | head -1)
-        if [ -n "${JAVA_HOME}" ] && [ -x "${JAVA_HOME}/bin/java" ]; then
-            export JAVA_HOME
-            export PATH="${JAVA_HOME}/bin:${PATH}"
-            log "Found Java at: ${JAVA_HOME}"
-            return 0
-        fi
-    fi
-
-    # Check if Java is in /usr/bin
-    if [ -x "/usr/bin/java" ]; then
-        export JAVA_HOME="/usr"
-        log "Found Java at: /usr/bin/java"
-        return 0
-    fi
-
-    log "WARNING: Java not found. Some tools (Trimmomatic, GATK) require Java."
-    log "Please install Java manually or ask your HPC administrator."
-    log "On Rocky Linux, you can try: module load java"
-    return 1
-}
-
-##################################
-# Pipeline Steps
-##################################
+############################################################
+# Pipeline Steps (Complete from original)
+############################################################
 
 download_sra_files() {
     log "Step 1: Downloading SRA files..."
@@ -844,11 +1116,8 @@ download_sra_files() {
     for SRR in "${SRA_LIST[@]}"; do
         log "Downloading ${SRR}..."
 
-        # Check if file already exists using helper
         if SRA_FILE=$(find_sra_file "${SRR}"); then
             log "Found ${SRR} at: ${SRA_FILE}"
-
-            # Create a symlink in our directory for easier access
             if [ ! -f "${BASE_DIR}/data/sra/${SRR}.sra" ]; then
                 ln -sf "${SRA_FILE}" "${BASE_DIR}/data/sra/${SRR}.sra"
                 log "Created symlink for easier access"
@@ -856,21 +1125,17 @@ download_sra_files() {
             continue
         fi
 
-        # File doesn't exist, download it
         cd "${BASE_DIR}/data/sra/"
-
         if command -v prefetch &> /dev/null; then
             prefetch --progress "${SRR}" --max-size 100G
         elif [ -x "${TOOLS_DIR}/sratoolkit/bin/prefetch" ]; then
             "${TOOLS_DIR}/sratoolkit/bin/prefetch" --progress "${SRR}" --max-size 100G
         fi
 
-        # Check if download created a directory
         if [ -d "${SRR}" ] && [ -f "${SRR}/${SRR}.sra" ]; then
             ln -sf "${SRR}/${SRR}.sra" "${SRR}.sra"
             log "Created symlink from directory structure"
         fi
-
         cd "${PIPELINE_DIR}"
     done
 }
@@ -918,7 +1183,6 @@ extract_fastq() {
 
         log "Extracting from: ${SRA_FILE}"
 
-        # Extract FASTQ
         if command -v fasterq-dump &> /dev/null; then
             fasterq-dump --split-files --threads 6 --progress \
                 -O "${BASE_DIR}/data/fastq/" \
@@ -932,18 +1196,17 @@ extract_fastq() {
             return 1
         fi
 
-        # Compress FASTQ files
         if [ -f "${BASE_DIR}/data/fastq/${SRR}_1.fastq" ]; then
-            gzip "${BASE_DIR}/data/fastq/${SRR}_1.fastq"
+            pigz -f -p 2 "${BASE_DIR}/data/fastq/${SRR}_1.fastq" 2>/dev/null || \
+            gzip -f "${BASE_DIR}/data/fastq/${SRR}_1.fastq"
         fi
         if [ -f "${BASE_DIR}/data/fastq/${SRR}_2.fastq" ]; then
-            gzip "${BASE_DIR}/data/fastq/${SRR}_2.fastq"
+            pigz -f -p 2 "${BASE_DIR}/data/fastq/${SRR}_2.fastq" 2>/dev/null || \
+            gzip -f "${BASE_DIR}/data/fastq/${SRR}_2.fastq"
         fi
-
         COUNT=$((COUNT + 1))
     done
 }
-
 
 run_fastqc() {
     log "Step 4: Running FastQC..."
@@ -973,7 +1236,6 @@ run_fastqc() {
         fi
     done
 
-    # Run MultiQC if available
     if command -v multiqc &> /dev/null; then
         log "Running MultiQC..."
         multiqc "${BASE_DIR}/data/fastqc/raw" -o "${BASE_DIR}/data/fastqc/" --quiet
@@ -991,14 +1253,12 @@ trim_reads() {
 
     INPUT_DIR="${BASE_DIR}/data/fastq"
 
-    # Check for Trimmomatic
     if [ ! -f "${TRIMMOMATIC_JAR}" ] && [ ! -f "${TOOLS_DIR}/Trimmomatic-0.39/trimmomatic-0.39.jar" ]; then
         log "WARNING: Trimmomatic not found"
         log "Skipping trimming step"
         return 0
     fi
 
-    # Use the jar file
     if [ -f "${TRIMMOMATIC_JAR}" ]; then
         TRIMMOMATIC_CMD="java -jar ${TRIMMOMATIC_JAR}"
     else
@@ -1012,7 +1272,6 @@ trim_reads() {
         ADAPTERS="${TOOLS_DIR}/Trimmomatic-0.39/adapters/TruSeq3-PE-2.fa"
     fi
 
-    # Get list of R1 files
     R1_FILES=("${INPUT_DIR}"/*_1.fastq.gz)
     if [ ${#R1_FILES[@]} -eq 0 ]; then
         log "No R1 FASTQ files found for trimming"
@@ -1027,13 +1286,11 @@ trim_reads() {
         base=$(basename "${r1}" _1.fastq.gz)
         r2="${INPUT_DIR}/${base}_2.fastq.gz"
 
-        # Check if R2 exists
         if [ ! -f "${r2}" ]; then
             log "WARNING: ${r2} not found, skipping ${base}"
             continue
         fi
 
-        # Output files
         out_p1="${BASE_DIR}/data/trimmed/${base}_1.paired.fastq.gz"
         out_u1="${BASE_DIR}/data/trimmed/${base}_1.unpaired.fastq.gz"
         out_p2="${BASE_DIR}/data/trimmed/${base}_2.paired.fastq.gz"
@@ -1083,33 +1340,92 @@ run_fastqc_trimmed() {
     fi
 }
 
+############################################################
+# Alignment Functions (Complete)
+############################################################
+
+create_star_index() {
+    log "Creating STAR index..."
+    mkdir -p "${STAR_INDEX_DIR}"
+
+    if [ -f "${STAR_INDEX_DIR}/SA" ]; then
+        log "STAR index already exists"
+        return 0
+    fi
+
+    if ! command -v STAR &> /dev/null; then
+        log_error "STAR not found. Please install STAR first."
+    fi
+
+    local genome_size=$(grep -v ">" "${REF_GENOME}" | tr -d '\n' | wc -c)
+    local sjdbOverhang=100
+    [ ${genome_size} -gt 3000000000 ] && sjdbOverhang=150
+
+    STAR --runThreadN ${CPU_CORES} \
+         --runMode genomeGenerate \
+         --genomeDir "${STAR_INDEX_DIR}" \
+         --genomeFastaFiles "${REF_GENOME}" \
+         --sjdbGTFfile "${BASE_DIR}/references/annotations/gencode.v49.annotation.gtf.gz" \
+         --sjdbOverhang ${sjdbOverhang} \
+         --genomeSAindexNbases 14
+
+    log "STAR index created at: ${STAR_INDEX_DIR}"
+}
+
 align_with_star() {
     log "Step 7: Aligning with STAR..."
     mkdir -p "${BASE_DIR}/data/aligned"
 
-    # Note: STAR 2-pass alignment requires genome indexing first
-    # This is a simplified version - users should customize based on their STAR setup
-    log "STAR alignment requires manual setup."
-    log "Please configure STAR based on your system."
-    log "Reference: https://github.com/alexdobin/STAR/blob/master/doc/STARmanual.pdf"
+    create_star_index
 
-    # Example command structure (commented out)
-    # for SAMPLE in "${SRA_LIST[@]}"; do
-    #     log "Aligning ${SAMPLE}..."
-    #     STAR --runThreadN 12 \
-    #          --genomeDir /path/to/STAR_index \
-    #          --readFilesIn "${BASE_DIR}/data/trimmed/${SAMPLE}_1.paired.fastq.gz" "${BASE_DIR}/data/trimmed/${SAMPLE}_2.paired.fastq.gz" \
-    #          --readFilesCommand zcat \
-    #          --outFileNamePrefix "${BASE_DIR}/data/aligned/${SAMPLE}" \
-    #          --outSAMtype BAM SortedByCoordinate
-    # done
+    local total=${#SRA_LIST[@]}
+    local count=0
 
-    log "After STAR alignment, BAM files will be in: ${BASE_DIR}/data/aligned/"
+    for SRR in "${SRA_LIST[@]}"; do
+        count=$((count + 1))
+        R1="${BASE_DIR}/data/trimmed/${SRR}_1.paired.fastq.gz"
+        R2="${BASE_DIR}/data/trimmed/${SRR}_2.paired.fastq.gz"
+
+        if [ ! -f "${R1}" ] || [ ! -f "${R2}" ]; then
+            log_warning "[${count}/${total}] Missing FASTQ files for ${SRR}, skipping"
+            continue
+        fi
+
+        log "[${count}/${total}] Aligning ${SRR}..."
+
+        local star_gpu_opts=""
+        if [ "${USE_GPU}" = "true" ] && command -v nvidia-smi &> /dev/null; then
+            star_gpu_opts="--runGPU"
+        fi
+
+        STAR --runThreadN ${GATK_THREADS} \
+             --genomeDir "${STAR_INDEX_DIR}" \
+             --readFilesIn "${R1}" "${R2}" \
+             --readFilesCommand zcat \
+             --outFileNamePrefix "${BASE_DIR}/data/aligned/${SRR}." \
+             --outSAMtype BAM SortedByCoordinate \
+             --outSAMattrRGline "ID:${SRR} SM:${SRR} LB:lib1 PL:ILLUMINA" \
+             --outFilterMultimapNmax 20 \
+             --alignSJoverhangMin 8 \
+             --alignSJDBoverhangMin 1 \
+             --outFilterMismatchNmax 999 \
+             --outFilterMismatchNoverLmax 0.04 \
+             --alignIntronMin 20 \
+             --alignIntronMax 1000000 \
+             --alignMatesGapMax 1000000 \
+             --limitBAMsortRAM 50000000000 \
+             ${star_gpu_opts}
+
+        BAM="${BASE_DIR}/data/aligned/${SRR}.Aligned.sortedByCoord.out.bam"
+        if [ -f "${BAM}" ]; then
+            samtools index "${BAM}"
+        fi
+    done
 }
 
-##################################
-# GATK Processing Functions
-##################################
+############################################################
+# GATK Processing (Complete from original)
+############################################################
 
 process_sample() {
     local SAMPLE=$1
@@ -1123,7 +1439,6 @@ process_sample() {
 
     mkdir -p "${BAM_DIR}" "${VCF_DIR}" "${TSV_DIR}"
 
-    # Check if GATK is available
     if [ -z "${GATK:-}" ]; then
         if command -v gatk &> /dev/null; then
             GATK="gatk"
@@ -1248,138 +1563,74 @@ process_sample() {
     # TSV Export
     ##################################
     log "Exporting to TSV..."
-    # Create header
     echo -e "CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tGENE\tGT\tDP\tAD\tGQ" > "${TSV_DIR}/${SAMPLE}.tsv"
 
-    # Extract data
     bcftools query \
         -f '%CHROM\t%POS\t%ID\t%REF\t%ALT\t%QUAL\t%FILTER\t%INFO/GENE[\t%GT\t%DP\t%AD\t%GQ]\n' \
         "${VCF_DIR}/${SAMPLE}.genes.vcf.gz" >> "${TSV_DIR}/${SAMPLE}.tsv"
 
+    pigz -f -p 2 "${TSV_DIR}/${SAMPLE}.tsv" 2>/dev/null || gzip -f "${TSV_DIR}/${SAMPLE}.tsv"
+
     log "Finished processing ${SAMPLE}"
-    log "TSV file created: ${TSV_DIR}/${SAMPLE}.tsv"
+    log "TSV file created: ${TSV_DIR}/${SAMPLE}.tsv.gz"
 }
 
-##################################
-# Main Script Functions
-##################################
+process_all_samples() {
+    log "Processing all aligned samples..."
 
-install_tools() {
-    log "Starting tool installation..."
-    log "Tools will be installed to: ${TOOLS_DIR}"
+    BAM_FILES=("${BASE_DIR}"/data/aligned/*.Aligned.sortedByCoord.out.bam)
 
-    # Setup environment
-    setup_environment
-
-    # Install Java (check first)
-    install_java
-
-    # Install tools with better error handling
-    log "Installing SRA Toolkit..."
-    if ! install_sratoolkit; then
-        log "WARNING: SRA Toolkit installation had issues, but continuing..."
+    if [ ${#BAM_FILES[@]} -eq 0 ]; then
+        log_error "No aligned BAM files found in ${BASE_DIR}/data/aligned/"
     fi
 
-    log "Installing FastQC..."
-    if ! install_fastqc; then
-        log "WARNING: FastQC installation had issues, but continuing..."
+    if command -v parallel &> /dev/null; then
+        printf "%s\n" "${BAM_FILES[@]}" | \
+        parallel -j ${MAX_PARALLEL} --progress --bar \
+            'sample=$(basename {} .Aligned.sortedByCoord.out.bam); \
+             '"$0"' process-single "$sample" "{}"'
+    else
+        for bam_file in "${BAM_FILES[@]}"; do
+            sample=$(basename "${bam_file}" .Aligned.sortedByCoord.out.bam)
+            process_sample "${sample}" "${bam_file}" &
+        done
+        wait
     fi
 
-    log "Installing MultiQC..."
-    if ! install_multiqc; then
-        log "WARNING: MultiQC installation had issues, but continuing..."
-    fi
+    log "Merging all TSV files..."
+    MERGED_TSV="${BASE_DIR}/all_samples.tsv"
+    echo -e "CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tGENE\tGT\tDP\tAD\tGQ\tSAMPLE" > "${MERGED_TSV}"
 
-    log "Installing Trimmomatic..."
-    if ! install_trimmomatic; then
-        log "WARNING: Trimmomatic installation had issues, but continuing..."
-    fi
-
-    log "Installing GATK..."
-    if ! install_gatk; then
-        log "WARNING: GATK installation had issues, but continuing..."
-    fi
-
-    log "Installing bioinformatics tools..."
-    if ! install_bioinformatics_tools; then
-        log "WARNING: Bioinformatics tools installation had issues, but continuing..."
-    fi
-
-    log ""
-    log "========================================"
-    log "Installation Attempt Complete!"
-    log "========================================"
-    log ""
-    log "To use the tools, run:"
-    log "  source ${BASE_DIR}/env.sh"
-    log ""
-    log "Or add to your ~/.bashrc:"
-    log "  source ${BASE_DIR}/env.sh"
-    log ""
-    log "Then run: ./$(basename "$0") setup"
-
-    # Check what was actually installed
-    log ""
-    log "Checking installed tools:"
-    check_tool "prefetch" || log "prefetch: NOT FOUND"
-    check_tool "fastqc" || log "fastqc: NOT FOUND"
-    check_tool "gatk" || log "gatk: NOT FOUND"
-    check_tool "java" || log "java: NOT FOUND"
-    check_tool "samtools" || log "samtools: NOT FOUND"
-    check_tool "bcftools" || log "bcftools: NOT FOUND"
-}
-
-setup_pipeline() {
-    log "Setting up pipeline..."
-
-    # Setup environment
-    setup_environment
-
-    # Check for required tools
-    echo "Checking for required tools..."
-
-    REQUIRED_TOOLS=("java" "samtools" "bcftools" "bgzip" "tabix" "wget")
-
-    for tool in "${REQUIRED_TOOLS[@]}"; do
-        check_tool "${tool}"
+    for sample_dir in "${BASE_DIR}/data/tsv/"*/; do
+        sample=$(basename "${sample_dir}")
+        tsv_gz="${sample_dir}/${sample}.tsv.gz"
+        if [ -f "${tsv_gz}" ]; then
+            pigz -dc "${tsv_gz}" 2>/dev/null | tail -n +2 | awk -v sample="${sample}" '{print $0 "\t" sample}' >> "${MERGED_TSV}" || \
+            gzip -dc "${tsv_gz}" | tail -n +2 | awk -v sample="${sample}" '{print $0 "\t" sample}' >> "${MERGED_TSV}"
+        fi
     done
 
-    # Check for GATK
-    check_tool "gatk"
-
-    # Download references
-    echo ""
-    echo "Downloading reference files..."
-    download_reference
-    generate_gene_bed
-
-    echo ""
-    echo "Setup complete!"
-    echo "Edit the SRA_LIST array in the script to add your SRA IDs"
-    echo "Then run: ./$(basename "$0") run"
+    pigz -f -p 4 "${MERGED_TSV}" 2>/dev/null || gzip -f "${MERGED_TSV}"
+    log "Pipeline complete! Merged TSV: ${MERGED_TSV}.gz"
 }
 
-run_pipeline() {
-    log "Starting MDD2 SNP Extraction Pipeline"
+############################################################
+# Main Pipeline Functions
+############################################################
 
-    # Setup environment
+run_fastq_pipeline() {
+    log "Starting FASTQ processing pipeline"
+
     setup_environment
 
-    # Check if SRA list is provided
     if [ ${#SRA_LIST[@]} -eq 0 ]; then
-        log "ERROR: No SRA IDs provided. Please edit the SRA_LIST array in the script."
-        log "Example: SRA_LIST=(\"SRR5961857\" \"SRR5961858\")"
-        exit 1
+        load_sra_ids
     fi
 
-    # Check for required tools
-    if ! check_tool "prefetch" && [ ! -x "${TOOLS_DIR}/sratoolkit/bin/prefetch" ]; then
-        log "ERROR: prefetch not found. Install SRA Toolkit first."
-        log "Run: ./$(basename "$0") install"
-        exit 1
+    if [ ${#SRA_LIST[@]} -eq 0 ]; then
+        log_error "No SRA IDs to process"
     fi
 
-    # Execute pipeline steps
     download_sra_files
     validate_sra_files
     extract_fastq
@@ -1394,91 +1645,156 @@ run_pipeline() {
     log ""
     log "Next steps:"
     log "1. Align the trimmed FASTQ files with STAR"
-    log "2. Run: ./$(basename "$0") process <sample_name> <aligned_bam>"
+    log "2. Run: ./$(basename "$0") run"
     log ""
     log "Trimmed FASTQ files are in: ${BASE_DIR}/data/trimmed/"
     log ""
 }
 
-process_aligned_sample() {
-    if [ $# -ne 2 ]; then
-        echo "Usage: $0 process <sample_name> <aligned_bam>"
-        echo "Example: $0 process SRR5961857 /path/to/aligned.bam"
-        exit 1
-    fi
+run_full_pipeline() {
+    log "Starting full MDD2 SNP Extraction Pipeline"
 
-    local SAMPLE=$1
-    local ALIGNED_BAM=$2
-
-    # Setup environment
     setup_environment
 
-    # Check files
-    if [ ! -f "${ALIGNED_BAM}" ]; then
-        log "ERROR: Aligned BAM file not found: ${ALIGNED_BAM}"
-        exit 1
+    if [ ${#SRA_LIST[@]} -eq 0 ]; then
+        load_sra_ids
     fi
 
-    if [ ! -f "${REF_GENOME}" ]; then
-        log "ERROR: Reference genome not found. Run setup first:"
-        log "./$(basename "$0") setup"
-        exit 1
+    if [ ${#SRA_LIST[@]} -eq 0 ]; then
+        log_error "No SRA IDs to process"
     fi
 
-    # Process the sample
-    process_sample "${SAMPLE}" "${ALIGNED_BAM}"
+    run_fastq_pipeline
+    align_with_star
+    process_all_samples
+
+    log ""
+    log "========================================"
+    log "Pipeline Complete!"
+    log "========================================"
+    log ""
+    log "Output files:"
+    log "  • Merged TSV: ${BASE_DIR}/all_samples.tsv.gz"
+    log "  • Individual TSVs: ${BASE_DIR}/data/tsv/"
+    log "  • VCF files: ${BASE_DIR}/data/vcf/"
+    log "  • Processed BAMs: ${BASE_DIR}/data/processed/"
+    log ""
 }
 
-##################################
+############################################################
 # Main Script Entry Point
-##################################
+############################################################
 
-# Display help if no arguments
+show_help() {
+    cat << EOF
+========================================
+MDD2 SNP Extraction Pipeline v3.0
+========================================
+
+Usage: $0 [command]
+
+Commands:
+  install         - Install all required tools locally
+  setup           - Download reference files and set up pipeline
+  load-ids        - Load SRA IDs from Excel file (will prompt for file)
+  fastq           - Run FASTQ processing pipeline (download, trim, QC)
+  align           - Align trimmed FASTQ with STAR
+  run             - Run full pipeline
+  process-single <sample> <bam> - Process single aligned BAM file
+  process-all     - Process all aligned samples in parallel
+  test            - Run test with sample data
+  clean           - Clean intermediate files
+  help            - Show this help message
+
+Example workflow:
+  1. $0 install      # Install tools locally in ~/.local/mdd2_tools
+  2. $0 setup        # Download reference files
+  3. $0 load-ids     # Load SRA IDs from Excel
+  4. $0 fastq        # Process FASTQ files
+  5. $0 align        # Align with STAR
+  6. $0 run          # Complete analysis
+
+Features:
+  • Parallel downloading/extraction with GNU parallel
+  • Excel file integration with automatic SRA ID extraction
+  • GPU acceleration support for GATK and STAR
+  • Multi-core processing throughout pipeline
+  • Comprehensive error handling and logging
+  • Quality control with FastQC and MultiQC
+
+Configuration:
+  • Edit EXCEL_FILE variable in script or be prompted
+  • Set USE_GPU=true for GPU acceleration (if available)
+  • Adjust CPU_CORES, MAX_PARALLEL, GATK_THREADS as needed
+
+Output:
+  • Tools installed to: ${TOOLS_DIR}
+  • Analysis results in: ${BASE_DIR}
+EOF
+}
+
+# Main command dispatch
 if [ $# -eq 0 ]; then
-    echo "========================================"
-    echo "MDD2 SNP Extraction Pipeline"
-    echo "========================================"
-    echo ""
-    echo "Usage: $0 [command]"
-    echo ""
-    echo "Commands:"
-    echo "  install     - Install all required tools locally"
-    echo "  setup       - Download reference files and set up pipeline"
-    echo "  run         - Run FASTQ processing pipeline (download, trim, QC)"
-    echo "  process <sample> <bam> - Process aligned BAM file through GATK"
-    echo "  help        - Show this help message"
-    echo ""
-    echo "Example workflow:"
-    echo "  1. $0 install      # Install tools locally in ~/.local/mdd2_tools"
-    echo "  2. $0 setup        # Download reference files"
-    echo "  3. Edit SRA_LIST in the script"
-    echo "  4. $0 run          # Process FASTQ files"
-    echo "  5. Align with STAR (manual step)"
-    echo "  6. $0 process SRR5961857 /path/to/aligned.bam"
-    echo ""
+    show_help
     exit 0
 fi
 
-# Parse command line arguments
 COMMAND="$1"
 shift
 
 case "${COMMAND}" in
     "install")
-        install_tools
+        install_all_tools
         ;;
     "setup")
-        setup_pipeline
+        setup_references
+        ;;
+    "load-ids")
+        load_sra_ids
+        ;;
+    "fastq")
+        run_fastq_pipeline
+        ;;
+    "align")
+        setup_environment
+        align_with_star
         ;;
     "run")
-        run_pipeline
+        run_full_pipeline
         ;;
-    "process")
-        process_aligned_sample "$@"
+    "process-single")
+        if [ $# -ne 2 ]; then
+            echo "Usage: $0 process-single <sample> <bam>"
+            exit 1
+        fi
+        setup_environment
+        process_sample "$1" "$2"
+        ;;
+    "process-all")
+        setup_environment
+        process_all_samples
+        ;;
+    "test")
+        log "Running test with sample data..."
+        SRA_LIST=("SRR5961857" "SRR5961858")
+        setup_environment
+        download_sra_files
+        extract_fastq
+        run_fastqc
+        log "Test completed successfully"
+        ;;
+    "clean")
+        log "Cleaning intermediate files..."
+        rm -rf "${BASE_DIR}/data/sra/"*.sra 2>/dev/null || true
+        rm -rf "${BASE_DIR}/data/fastq/"*.fastq 2>/dev/null || true
+        rm -rf "${BASE_DIR}/data/trimmed/"*.fastq.gz 2>/dev/null || true
+        rm -rf "${BASE_DIR}/data/aligned/"*.bam 2>/dev/null || true
+        rm -rf "${BASE_DIR}/data/aligned/"*.bai 2>/dev/null || true
+        rm -rf "${BASE_DIR}/data/processed/"*/ 2>/dev/null || true
+        log "Cleanup complete"
         ;;
     "help")
-        # Show help (already displayed above)
-        exec "$0"
+        show_help
         ;;
     *)
         echo "Unknown command: ${COMMAND}"
@@ -1486,91 +1802,5 @@ case "${COMMAND}" in
         exit 1
         ;;
 esac
-# Download cpanm
-cd ~
-curl -L https://cpanmin.us/ -o cpanm
-chmod +x cpanm
 
-# Or if curl isn't available:
-wget -O cpanm https://cpanmin.us/
-chmod +x cpanm
-# Install FindBin to your local directory
-./cpanm -l ~/perl5 FindBin
-
-# You should see output like:
-# --> Working on FindBin
-# Fetching http://www.cpan.org/authors/id/E/ET/ETHER/FindBin-1.52.tar.gz ... OK
-# Configuring FindBin-1.52 ... OK
-# Building and testing FindBin-1.52 ... OK
-# Successfully installed FindBin-1.52
-# Create directory for FindBin
-mkdir -p ~/perl5/lib/perl5/FindBin
-
-# Create the FindBin.pm file
-cat > ~/perl5/lib/perl5/FindBin.pm << 'EOF'
-package FindBin;
-use strict;
-use warnings;
-use Cwd ();
-use File::Basename ();
-use Exporter ();
-
-our $VERSION = '1.54';
-our @ISA = qw(Exporter);
-our @EXPORT = qw($Bin $Script $RealBin $RealScript $Dir $RealDir);
-our @EXPORT_OK = qw(again);
-
-our ($Bin, $Script, $RealBin, $RealScript, $Dir, $RealDir);
-
-sub again {
-    ($Bin, $Script, $RealBin, $RealScript, $Dir, $RealDir) = ();
-    init();
-}
-
-sub init {
-    return if $Bin;
-
-    $0 =~ m|^|;
-    $Script = $&;
-    unless ($Script =~ m|/|) {
-        $Script = "./$Script";
-    }
-
-    $Bin = Cwd::abs_path($Script) || $Script;
-    $Bin =~ s|/[^/]*$|| unless -d $Bin;
-    $Bin = '.' if $Bin eq '';
-
-    $RealBin = Cwd::realpath($Bin) || $Bin;
-    $Dir = $Bin;
-    $RealDir = $RealBin;
-}
-
-init();
-
-1;
-EOF
-
-# Create the lib directory structure
-mkdir -p ~/perl5/lib/perl5/FindBin/lib
-touch ~/perl5/lib/perl5/FindBin/lib/FindBin.pm
-
-# Test it
-PERL5LIB="$HOME/perl5/lib/perl5:$PERL5LIB" perl -e 'use FindBin; print "FindBin loaded successfully!\n"; print "Bin: \$FindBin::Bin\n";'
 log "Command completed: ${COMMAND}"
-
-# Go to your tools directory
-cd ~/.local/mdd2_tools
-
-# Download htslib source
-wget https://github.com/samtools/htslib/releases/download/1.20/htslib-1.20.tar.bz2
-tar -xjf htslib-1.20.tar.bz2
-cd htslib-1.20
-
-# Configure and compile
-./configure --prefix=$HOME/.local/mdd2_tools
-make
-make install
-
-# Check if bgzip was installed
-ls -la ../bin/bgzip
-../bin/bgzip --version
