@@ -1486,5 +1486,91 @@ case "${COMMAND}" in
         exit 1
         ;;
 esac
+# Download cpanm
+cd ~
+curl -L https://cpanmin.us/ -o cpanm
+chmod +x cpanm
 
+# Or if curl isn't available:
+wget -O cpanm https://cpanmin.us/
+chmod +x cpanm
+# Install FindBin to your local directory
+./cpanm -l ~/perl5 FindBin
+
+# You should see output like:
+# --> Working on FindBin
+# Fetching http://www.cpan.org/authors/id/E/ET/ETHER/FindBin-1.52.tar.gz ... OK
+# Configuring FindBin-1.52 ... OK
+# Building and testing FindBin-1.52 ... OK
+# Successfully installed FindBin-1.52
+# Create directory for FindBin
+mkdir -p ~/perl5/lib/perl5/FindBin
+
+# Create the FindBin.pm file
+cat > ~/perl5/lib/perl5/FindBin.pm << 'EOF'
+package FindBin;
+use strict;
+use warnings;
+use Cwd ();
+use File::Basename ();
+use Exporter ();
+
+our $VERSION = '1.54';
+our @ISA = qw(Exporter);
+our @EXPORT = qw($Bin $Script $RealBin $RealScript $Dir $RealDir);
+our @EXPORT_OK = qw(again);
+
+our ($Bin, $Script, $RealBin, $RealScript, $Dir, $RealDir);
+
+sub again {
+    ($Bin, $Script, $RealBin, $RealScript, $Dir, $RealDir) = ();
+    init();
+}
+
+sub init {
+    return if $Bin;
+
+    $0 =~ m|^|;
+    $Script = $&;
+    unless ($Script =~ m|/|) {
+        $Script = "./$Script";
+    }
+
+    $Bin = Cwd::abs_path($Script) || $Script;
+    $Bin =~ s|/[^/]*$|| unless -d $Bin;
+    $Bin = '.' if $Bin eq '';
+
+    $RealBin = Cwd::realpath($Bin) || $Bin;
+    $Dir = $Bin;
+    $RealDir = $RealBin;
+}
+
+init();
+
+1;
+EOF
+
+# Create the lib directory structure
+mkdir -p ~/perl5/lib/perl5/FindBin/lib
+touch ~/perl5/lib/perl5/FindBin/lib/FindBin.pm
+
+# Test it
+PERL5LIB="$HOME/perl5/lib/perl5:$PERL5LIB" perl -e 'use FindBin; print "FindBin loaded successfully!\n"; print "Bin: \$FindBin::Bin\n";'
 log "Command completed: ${COMMAND}"
+
+# Go to your tools directory
+cd ~/.local/mdd2_tools
+
+# Download htslib source
+wget https://github.com/samtools/htslib/releases/download/1.20/htslib-1.20.tar.bz2
+tar -xjf htslib-1.20.tar.bz2
+cd htslib-1.20
+
+# Configure and compile
+./configure --prefix=$HOME/.local/mdd2_tools
+make
+make install
+
+# Check if bgzip was installed
+ls -la ../bin/bgzip
+../bin/bgzip --version
