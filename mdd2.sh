@@ -14,6 +14,7 @@ set -o pipefail
 # Configuration Section
 ############################################################
 
+KEEP_INTERMEDIATE=false
 PIPELINE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BASE_DIR="${PIPELINE_DIR}/analysis"
 TOOLS_DIR="${HOME}/.local/mdd2_tools"
@@ -845,25 +846,48 @@ download_reference() {
     wget -q -O "${MILLS}" "${MILLS_URL}"
     wget -q -O "${MILLS}.tbi" "${MILLS_URL}.tbi"
 
+    # Ensure GTF is downloaded if not already
+    GTF_GZ="${BASE_DIR}/references/annotations/gencode.v49.annotation.gtf.gz"
+    if [ ! -f "${GTF_GZ}" ]; then
+        log "Downloading Gencode annotation GTF..."
+        mkdir -p "$(dirname "${GTF_GZ}")"
+        wget -q -O "${GTF_GZ}" \
+            "https://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_human/release_49/gencode.v49.annotation.gtf.gz"
+    else
+        log "GTF file already exists: ${GTF_GZ}"
+    fi
+
     return 0
 }
 
 generate_gene_bed() {
     log "Generating gene BED file from Gencode annotation..."
-    GTF="${BASE_DIR}/references/annotations/gencode.v49.annotation.gtf.gz"
+    GTF_GZ="${BASE_DIR}/references/annotations/gencode.v49.annotation.gtf.gz"
+    GTF="${BASE_DIR}/references/annotations/gencode.v49.annotation.gtf"
     GENE_BED="${BASE_DIR}/references/annotations/genes.bed"
 
-    mkdir -p "$(dirname "${GTF}")"
+    mkdir -p "$(dirname "${GTF_GZ}")"
 
-    wget -q -O "${GTF}" \
-        "https://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_human/release_49/gencode.v49.annotation.gtf.gz"
+    # Download GTF if not already downloaded
+    if [ ! -f "${GTF_GZ}" ]; then
+        log "Downloading Gencode annotation..."
+        wget -q -O "${GTF_GZ}" \
+            "https://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_human/release_49/gencode.v49.annotation.gtf.gz"
+    fi
 
-    gunzip -c "${GTF}" | \
+    # Unzip for STAR
+    if [ ! -f "${GTF}" ]; then
+        log "Unzipping GTF file for gene BED generation..."
+        gunzip -c "${GTF_GZ}" > "${GTF}"
+    fi
+
+    # Generate BED file
+    log "Generating gene BED file..."
     awk 'BEGIN {OFS="\t"} $3 == "gene" {
         gene_name = "."
         if (match($0, /gene_name "([^"]+)"/, a)) gene_name = a[1]
         print $1, $4 - 1, $5, gene_name
-    }' > "${GENE_BED}"
+    }' "${GTF}" > "${GENE_BED}"
 
     if check_tool "bgzip"; then
         bgzip -c "${GENE_BED}" > "${GENE_BED}.gz"
@@ -878,6 +902,7 @@ generate_gene_bed() {
     echo -e '##INFO=<ID=GENE,Number=1,Type=String,Description="Gene name">' > "${GENE_BED}.hdr"
 
     log "Gene BED file created: ${GENE_BED}.gz"
+    log "Unzipped GTF file available for STAR: ${GTF}"
 }
 
 download_funcotator() {
@@ -1103,6 +1128,387 @@ load_sra_ids() {
     else
         log_error "Failed to extract SRA IDs from Excel file"
     fi
+}
+#=================================================================
+# For single SRA files
+#=================================================================
+
+trim_single_sample() {
+    local SRR="$1"
+    local INPUT_DIR="${BASE_DIR}/data/fastq"
+
+    if [ ! -f "${TRIMMOMATIC_JAR}" ] && [ ! -f "${TOOLS_DIR}/Trimmomatic-0.39/trimmomatic-0.39.jar" ]; then
+        log "Trimmomatic not found, skipping trim for ${SRR}"
+        return 0
+    fi
+
+    if [ -f "${TRIMMOMATIC_JAR}" ]; then
+        TRIMMOMATIC_CMD="java -jar ${TRIMMOMATIC_JAR}"
+    else
+        TRIMMOMATIC_CMD="java -jar ${TOOLS_DIR}/Trimmomatic-0.39/trimmomatic-0.39.jar"
+    fi
+
+    ADAPTERS="${TOOLS_DIR}/Trimmomatic-0.39/adapters/TruSeq3-PE.fa"
+    if [ ! -f "${ADAPTERS}" ]; then
+        ADAPTERS="${TOOLS_DIR}/Trimmomatic-0.39/adapters/TruSeq3-PE-2.fa"
+    fi
+
+    r1="${INPUT_DIR}/${SRR}_1.fastq.gz"
+    r2="${INPUT_DIR}/${SRR}_2.fastq.gz"
+
+    if [ ! -f "${r1}" ] || [ ! -f "${r2}" ]; then
+        log_warning "Missing FASTQ files for ${SRR}, skipping trim"
+        return 0
+    fi
+
+    out_p1="${BASE_DIR}/data/trimmed/${SRR}_1.paired.fastq.gz"
+    out_u1="${BASE_DIR}/data/trimmed/${SRR}_1.unpaired.fastq.gz"
+    out_p2="${BASE_DIR}/data/trimmed/${SRR}_2.paired.fastq.gz"
+    out_u2="${BASE_DIR}/data/trimmed/${SRR}_2.unpaired.fastq.gz"
+
+    log "Trimming adapters from: ${SRR}"
+    ${TRIMMOMATIC_CMD} PE -threads 6 -phred33 \
+        "${r1}" "${r2}" \
+        "${out_p1}" "${out_u1}" \
+        "${out_p2}" "${out_u2}" \
+        ILLUMINACLIP:"${ADAPTERS}":2:30:10 \
+        LEADING:3 \
+        TRAILING:3 \
+        SLIDINGWINDOW:4:15 \
+        MINLEN:36
+}
+
+align_single_sample() {
+    local SRR="$1"
+
+    # Check if STAR index exists (check for SA file, not just directory)
+    if [ ! -f "${STAR_INDEX_DIR}/SA" ]; then
+        log "STAR index not found or incomplete, creating index..."
+        create_star_index
+    fi
+
+    R1="${BASE_DIR}/data/trimmed/${SRR}_1.paired.fastq.gz"
+    R2="${BASE_DIR}/data/trimmed/${SRR}_2.paired.fastq.gz"
+
+    if [ ! -f "${R1}" ] || [ ! -f "${R2}" ]; then
+        log_warning "Missing trimmed FASTQ files for ${SRR}, skipping alignment"
+        return 0
+    fi
+
+    log "Aligning ${SRR} with STAR..."
+    local star_gpu_opts=""
+    if [ "${USE_GPU}" = "true" ] && command -v nvidia-smi &> /dev/null; then
+        star_gpu_opts="--runGPU"
+    fi
+
+    STAR --runThreadN ${GATK_THREADS} \
+         --genomeDir "${STAR_INDEX_DIR}" \
+         --readFilesIn "${R1}" "${R2}" \
+         --readFilesCommand zcat \
+         --outFileNamePrefix "${BASE_DIR}/data/aligned/${SRR}." \
+         --outSAMtype BAM SortedByCoordinate \
+         --outSAMattrRGline "ID:${SRR} SM:${SRR} LB:lib1 PL:ILLUMINA" \
+         --outFilterMultimapNmax 20 \
+         --alignSJoverhangMin 8 \
+         --alignSJDBoverhangMin 1 \
+         --outFilterMismatchNmax 999 \
+         --outFilterMismatchNoverLmax 0.04 \
+         --alignIntronMin 20 \
+         --alignIntronMax 1000000 \
+         --alignMatesGapMax 1000000 \
+         --limitBAMsortRAM 50000000000 \
+         ${star_gpu_opts}
+
+    BAM="${BASE_DIR}/data/aligned/${SRR}.Aligned.sortedByCoord.out.bam"
+    if [ -f "${BAM}" ]; then
+        samtools index "${BAM}"
+    fi
+}
+
+download_single_sra() {
+    local SRR="$1"
+    log "Downloading ${SRR}..."
+
+    mkdir -p "${BASE_DIR}/data/sra/"
+
+    if SRA_FILE=$(find_sra_file "${SRR}"); then
+        log "Found ${SRR} at: ${SRA_FILE}"
+        if [ ! -f "${BASE_DIR}/data/sra/${SRR}.sra" ]; then
+            ln -sf "${SRA_FILE}" "${BASE_DIR}/data/sra/${SRR}.sra"
+            log "Created symlink for easier access"
+        fi
+        return 0
+    fi
+
+    cd "${BASE_DIR}/data/sra/"
+    if command -v prefetch &> /dev/null; then
+        prefetch --progress "${SRR}" --max-size 100G
+    elif [ -x "${TOOLS_DIR}/sratoolkit/bin/prefetch" ]; then
+        "${TOOLS_DIR}/sratoolkit/bin/prefetch" --progress "${SRR}" --max-size 100G
+    fi
+
+    if [ -d "${SRR}" ] && [ -f "${SRR}/${SRR}.sra" ]; then
+        ln -sf "${SRR}/${SRR}.sra" "${SRR}.sra"
+        log "Created symlink from directory structure"
+    fi
+
+    cd "${PIPELINE_DIR}"
+
+    if [ ! -f "${BASE_DIR}/data/sra/${SRR}.sra" ]; then
+        log_error "Failed to download ${SRR}"
+    fi
+}
+
+validate_single_sra() {
+    local SRR="$1"
+    log "Validating ${SRR}..."
+
+    if SRA_FILE=$(find_sra_file "${SRR}"); then
+        log "Validating: ${SRA_FILE}"
+        if command -v vdb-validate &> /dev/null; then
+            vdb-validate "${SRA_FILE}"
+        elif [ -x "${TOOLS_DIR}/sratoolkit/bin/vdb-validate" ]; then
+            "${TOOLS_DIR}/sratoolkit/bin/vdb-validate" "${SRA_FILE}"
+        else
+            log "WARNING: vdb-validate not found, skipping validation"
+        fi
+    else
+        log_error "${SRR}.sra not found"
+    fi
+}
+
+extract_single_fastq() {
+    local SRR="$1"
+    log "Splitting ${SRR} into FASTQ..."
+    mkdir -p "${BASE_DIR}/data/fastq/"
+
+    if ! SRA_FILE=$(find_sra_file "${SRR}"); then
+        log_error "${SRR}.sra not found, cannot extract FASTQ"
+    fi
+
+    log "Extracting from: ${SRA_FILE}"
+
+    if command -v fasterq-dump &> /dev/null; then
+        fasterq-dump --split-files --threads 6 --progress \
+            -O "${BASE_DIR}/data/fastq/" \
+            "${SRA_FILE}"
+    elif [ -x "${TOOLS_DIR}/sratoolkit/bin/fasterq-dump" ]; then
+        "${TOOLS_DIR}/sratoolkit/bin/fasterq-dump" --split-files --threads 6 --progress \
+            -O "${BASE_DIR}/data/fastq/" \
+            "${SRA_FILE}"
+    else
+        log_error "fasterq-dump command not found"
+    fi
+
+    if [ -f "${BASE_DIR}/data/fastq/${SRR}_1.fastq" ]; then
+        pigz -f -p 2 "${BASE_DIR}/data/fastq/${SRR}_1.fastq" 2>/dev/null || \
+        gzip -f "${BASE_DIR}/data/fastq/${SRR}_1.fastq"
+    fi
+    if [ -f "${BASE_DIR}/data/fastq/${SRR}_2.fastq" ]; then
+        pigz -f -p 2 "${BASE_DIR}/data/fastq/${SRR}_2.fastq" 2>/dev/null || \
+        gzip -f "${BASE_DIR}/data/fastq/${SRR}_2.fastq"
+    fi
+}
+
+cleanup_intermediate() {
+    local SRR="$1"
+    local KEEP_INTERMEDIATE="${2:-false}"
+
+    if [ "${KEEP_INTERMEDIATE}" = "true" ]; then
+        log "Keeping intermediate files for ${SRR} (--keep-intermediate flag set)"
+        return 0
+    fi
+
+    log "Cleaning up intermediate files for ${SRR}..."
+
+    # Remove SRA file
+    rm -f "${BASE_DIR}/data/sra/${SRR}.sra" 2>/dev/null || true
+    rm -rf "${BASE_DIR}/data/sra/${SRR}" 2>/dev/null || true
+
+    # Remove FASTQ files
+    rm -f "${BASE_DIR}/data/fastq/${SRR}_1.fastq" 2>/dev/null || true
+    rm -f "${BASE_DIR}/data/fastq/${SRR}_2.fastq" 2>/dev/null || true
+    rm -f "${BASE_DIR}/data/fastq/${SRR}_1.fastq.gz" 2>/dev/null || true
+    rm -f "${BASE_DIR}/data/fastq/${SRR}_2.fastq.gz" 2>/dev/null || true
+
+    # Remove trimmed files (keep QC reports)
+    rm -f "${BASE_DIR}/data/trimmed/${SRR}_1.paired.fastq.gz" 2>/dev/null || true
+    rm -f "${BASE_DIR}/data/trimmed/${SRR}_1.unpaired.fastq.gz" 2>/dev/null || true
+    rm -f "${BASE_DIR}/data/trimmed/${SRR}_2.paired.fastq.gz" 2>/dev/null || true
+    rm -f "${BASE_DIR}/data/trimmed/${SRR}_2.unpaired.fastq.gz" 2>/dev/null || true
+
+    # Remove intermediate BAM files (keep final processed BAM)
+    rm -f "${BASE_DIR}/data/aligned/${SRR}.Aligned.sortedByCoord.out.bam" 2>/dev/null || true
+    rm -f "${BASE_DIR}/data/aligned/${SRR}.Aligned.sortedByCoord.out.bam.bai" 2>/dev/null || true
+    rm -f "${BASE_DIR}/data/aligned/${SRR}.Log.*" 2>/dev/null || true
+    rm -f "${BASE_DIR}/data/aligned/${SRR}.SJ.out.tab" 2>/dev/null || true
+
+    log "Intermediate files cleaned for ${SRR}"
+}
+
+check_disk_space() {
+    local required_mb="${1:-10240}"  # Default 10GB
+    local available_mb=$(df -m "${BASE_DIR}" | tail -1 | awk '{print $4}')
+
+    if [ "${available_mb}" -lt "${required_mb}" ]; then
+        log_warning "Low disk space: ${available_mb}MB available, ${required_mb}MB recommended"
+        return 1
+    fi
+
+    log "Disk space OK: ${available_mb}MB available"
+    return 0
+}
+
+run_full_pipeline() {
+    log "Starting full MDD2 SNP Extraction Pipeline"
+    setup_environment
+
+    if [ ${#SRA_LIST[@]} -eq 0 ]; then
+        load_sra_ids
+    fi
+
+    if [ ${#SRA_LIST[@]} -eq 0 ]; then
+        log_error "No SRA IDs to process"
+    fi
+
+    log "Processing ${#SRA_LIST[@]} samples sequentially with cleanup..."
+
+    # Process each sample completely before moving to next
+    for SRR in "${SRA_LIST[@]}"; do
+        log "========================================"
+        log "Processing FULL pipeline for: ${SRR}"
+        log "========================================"
+
+        check_disk_space 5120
+
+        # FASTQ steps
+        download_single_sra "${SRR}"
+        validate_single_sra "${SRR}"
+        extract_single_fastq "${SRR}"
+
+        # Immediate cleanup of SRA file
+        if [ "${KEEP_INTERMEDIATE}" != "true" ]; then
+            rm -f "${BASE_DIR}/data/sra/${SRR}.sra" 2>/dev/null || true
+        fi
+
+        # FASTQC for this sample
+        log "Running FastQC for ${SRR}..."
+        if [ -f "${BASE_DIR}/data/fastq/${SRR}_1.fastq.gz" ]; then
+            fastqc "${BASE_DIR}/data/fastq/${SRR}_1.fastq.gz" -o "${BASE_DIR}/data/fastqc/raw" --quiet 2>/dev/null || true
+        fi
+        if [ -f "${BASE_DIR}/data/fastq/${SRR}_2.fastq.gz" ]; then
+            fastqc "${BASE_DIR}/data/fastq/${SRR}_2.fastq.gz" -o "${BASE_DIR}/data/fastqc/raw" --quiet 2>/dev/null || true
+        fi
+
+        # Trim this sample
+        log "Trimming ${SRR}..."
+        if [ -f "${TRIMMOMATIC_JAR}" ] || [ -f "${TOOLS_DIR}/Trimmomatic-0.39/trimmomatic-0.39.jar" ]; then
+            trim_single_sample "${SRR}"
+        fi
+
+        # Align this sample
+        log "Aligning ${SRR} with STAR..."
+        align_single_sample "${SRR}"
+
+        # Process this sample (variant calling)
+        BAM_FILE="${BASE_DIR}/data/aligned/${SRR}.Aligned.sortedByCoord.out.bam"
+        if [ -f "${BAM_FILE}" ]; then
+            process_sample "${SRR}" "${BAM_FILE}"
+        else
+            log_warning "BAM file not found after alignment: ${BAM_FILE}"
+        fi
+
+        # Cleanup intermediate files for this sample
+        cleanup_intermediate "${SRR}" "${KEEP_INTERMEDIATE}"
+
+        log "Completed FULL processing for ${SRR}"
+    done
+
+    # Run MultiQC on all QC data
+    if command -v multiqc &> /dev/null; then
+        log "Running final MultiQC..."
+        multiqc "${BASE_DIR}/data/fastqc/" -o "${BASE_DIR}/data/fastqc/" --quiet
+    fi
+
+    # Merge all TSV files
+    log "Merging all TSV files..."
+    MERGED_TSV="${BASE_DIR}/all_samples.tsv"
+    echo -e "CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tGENE\tGT\tDP\tAD\tGQ\tSAMPLE" > "${MERGED_TSV}"
+
+    for sample_dir in "${BASE_DIR}/data/tsv/"*/; do
+        sample=$(basename "${sample_dir}")
+        tsv_gz="${sample_dir}/${sample}.tsv.gz"
+        if [ -f "${tsv_gz}" ]; then
+            pigz -dc "${tsv_gz}" 2>/dev/null | tail -n +2 | awk -v sample="${sample}" '{print $0 "\t" sample}' >> "${MERGED_TSV}" || \
+            gzip -dc "${tsv_gz}" | tail -n +2 | awk -v sample="${sample}" '{print $0 "\t" sample}' >> "${MERGED_TSV}"
+        fi
+    done
+
+    pigz -f -p 4 "${MERGED_TSV}" 2>/dev/null || gzip -f "${MERGED_TSV}"
+
+    log ""
+    log "========================================"
+    log "Pipeline Complete!"
+    log "========================================"
+    log ""
+    log "Output files:"
+    log "  • Merged TSV: ${BASE_DIR}/all_samples.tsv.gz"
+    log "  • Individual TSVs: ${BASE_DIR}/data/tsv/"
+    log "  • VCF files: ${BASE_DIR}/data/vcf/"
+    log "  • Processed BAMs: ${BASE_DIR}/data/processed/"
+    log "  • QC reports: ${BASE_DIR}/data/fastqc/"
+    log ""
+}
+
+run_fastq_pipeline() {
+    log "Starting FASTQ processing pipeline"
+    setup_environment
+
+    if [ ${#SRA_LIST[@]} -eq 0 ]; then
+        load_sra_ids
+    fi
+
+    if [ ${#SRA_LIST[@]} -eq 0 ]; then
+        log_error "No SRA IDs to process"
+    fi
+
+    log "Processing ${#SRA_LIST[@]} samples sequentially..."
+
+    for SRR in "${SRA_LIST[@]}"; do
+        log "========================================"
+        log "Processing sample: ${SRR}"
+        log "========================================"
+
+        # Check disk space before each download
+        check_disk_space 5120 || log_warning "Continuing despite low disk space"
+
+        download_single_sra "${SRR}"
+        validate_single_sra "${SRR}"
+        extract_single_fastq "${SRR}"
+
+        # Cleanup SRA file immediately after extraction
+        if [ "${KEEP_INTERMEDIATE}" != "true" ]; then
+            rm -f "${BASE_DIR}/data/sra/${SRR}.sra" 2>/dev/null || true
+            rm -rf "${BASE_DIR}/data/sra/${SRR}" 2>/dev/null || true
+        fi
+    done
+
+    # Run QC on all extracted FASTQ files
+    run_fastqc
+    trim_reads
+    run_fastqc_trimmed
+
+    log ""
+    log "========================================"
+    log "FASTQ Processing Complete!"
+    log "========================================"
+    log ""
+    log "Next steps:"
+    log "1. Align the trimmed FASTQ files with STAR"
+    log "2. Run: ./$(basename "$0") run"
+    log ""
+    log "Trimmed FASTQ files are in: ${BASE_DIR}/data/trimmed/"
+    log ""
 }
 
 ############################################################
@@ -1361,14 +1767,28 @@ create_star_index() {
     local sjdbOverhang=100
     [ ${genome_size} -gt 3000000000 ] && sjdbOverhang=150
 
+    # Check if GTF file is compressed and unzip if needed
+    GTF_FILE="${BASE_DIR}/references/annotations/gencode.v49.annotation.gtf.gz"
+    GTF_UNZIPPED="${BASE_DIR}/references/annotations/gencode.v49.annotation.gtf"
+
+    if [ -f "${GTF_FILE}" ]; then
+        log "Unzipping GTF file for STAR..."
+        gunzip -c "${GTF_FILE}" > "${GTF_UNZIPPED}"
+    elif [ -f "${GTF_UNZIPPED}" ]; then
+        log "Using existing unzipped GTF file"
+    else
+        log_error "GTF file not found: ${GTF_FILE}"
+    fi
+
     STAR --runThreadN ${CPU_CORES} \
          --runMode genomeGenerate \
          --genomeDir "${STAR_INDEX_DIR}" \
          --genomeFastaFiles "${REF_GENOME}" \
-         --sjdbGTFfile "${BASE_DIR}/references/annotations/gencode.v49.annotation.gtf.gz" \
+         --sjdbGTFfile "${GTF_UNZIPPED}" \
          --sjdbOverhang ${sjdbOverhang} \
          --genomeSAindexNbases 14
 
+    # Keep the unzipped GTF file for future use
     log "STAR index created at: ${STAR_INDEX_DIR}"
 }
 
@@ -1376,7 +1796,11 @@ align_with_star() {
     log "Step 7: Aligning with STAR..."
     mkdir -p "${BASE_DIR}/data/aligned"
 
-    create_star_index
+    # Check if STAR index exists (check for SA file, not just directory)
+    if [ ! -f "${STAR_INDEX_DIR}/SA" ]; then
+        log "STAR index not found or incomplete, creating index..."
+        create_star_index
+    fi
 
     local total=${#SRA_LIST[@]}
     local count=0
@@ -1403,7 +1827,7 @@ align_with_star() {
              --readFilesIn "${R1}" "${R2}" \
              --readFilesCommand zcat \
              --outFileNamePrefix "${BASE_DIR}/data/aligned/${SRR}." \
-             --outSAMtype BAM SortedByCoordinate \
+             --outSAMtype BAM SortedByCoordOut \
              --outSAMattrRGline "ID:${SRR} SM:${SRR} LB:lib1 PL:ILLUMINA" \
              --outFilterMultimapNmax 20 \
              --alignSJoverhangMin 8 \
@@ -1422,7 +1846,6 @@ align_with_star() {
         fi
     done
 }
-
 ############################################################
 # GATK Processing (Complete from original)
 ############################################################
@@ -1575,27 +1998,143 @@ process_sample() {
     log "TSV file created: ${TSV_DIR}/${SAMPLE}.tsv.gz"
 }
 
+
+############################################################
+# Main Pipeline Functions
+############################################################
+
+run_fastq_pipeline() {
+    log "Starting FASTQ processing pipeline"
+    setup_environment
+
+    if [ ${#SRA_LIST[@]} -eq 0 ]; then
+        load_sra_ids
+    fi
+
+    if [ ${#SRA_LIST[@]} -eq 0 ]; then
+        log_error "No SRA IDs to process"
+    fi
+
+    log "Processing ${#SRA_LIST[@]} samples sequentially..."
+
+    for SRR in "${SRA_LIST[@]}"; do
+        log "========================================"
+        log "Processing sample: ${SRR}"
+        log "========================================"
+
+        # Check disk space before each download
+        check_disk_space 5120 || log_warning "Continuing despite low disk space"
+
+        download_single_sra "${SRR}"
+        validate_single_sra "${SRR}"
+        extract_single_fastq "${SRR}"
+
+        # Cleanup SRA file immediately after extraction
+        if [ "${KEEP_INTERMEDIATE}" != "true" ]; then
+            rm -f "${BASE_DIR}/data/sra/${SRR}.sra" 2>/dev/null || true
+            rm -rf "${BASE_DIR}/data/sra/${SRR}" 2>/dev/null || true
+        fi
+    done
+
+    # Run QC on all extracted FASTQ files
+    run_fastqc
+    trim_reads
+    run_fastqc_trimmed
+
+    log ""
+    log "========================================"
+    log "FASTQ Processing Complete!"
+    log "========================================"
+    log ""
+    log "Next steps:"
+    log "1. Align the trimmed FASTQ files with STAR"
+    log "2. Run: ./$(basename "$0") run"
+    log ""
+    log "Trimmed FASTQ files are in: ${BASE_DIR}/data/trimmed/"
+    log ""
+}
+
+run_fastq_pipeline() {
+    log "Starting FASTQ processing pipeline"
+    setup_environment
+
+    if [ ${#SRA_LIST[@]} -eq 0 ]; then
+        load_sra_ids
+    fi
+
+    if [ ${#SRA_LIST[@]} -eq 0 ]; then
+        log_error "No SRA IDs to process"
+    fi
+
+    log "Processing ${#SRA_LIST[@]} samples sequentially..."
+
+    for SRR in "${SRA_LIST[@]}"; do
+        log "========================================"
+        log "Processing sample: ${SRR}"
+        log "========================================"
+
+        # Check disk space before each download
+        check_disk_space 5120 || log_warning "Continuing despite low disk space"
+
+        download_single_sra "${SRR}"
+        validate_single_sra "${SRR}"
+        extract_single_fastq "${SRR}"
+
+        # Cleanup SRA file immediately after extraction
+        if [ "${KEEP_INTERMEDIATE}" != "true" ]; then
+            rm -f "${BASE_DIR}/data/sra/${SRR}.sra" 2>/dev/null || true
+            rm -rf "${BASE_DIR}/data/sra/${SRR}" 2>/dev/null || true
+        fi
+    done
+
+    # Run QC on all extracted FASTQ files
+    run_fastqc
+    trim_reads
+    run_fastqc_trimmed
+
+    log ""
+    log "========================================"
+    log "FASTQ Processing Complete!"
+    log "========================================"
+    log ""
+    log "Next steps:"
+    log "1. Align the trimmed FASTQ files with STAR"
+    log "2. Run: ./$(basename "$0") run"
+    log ""
+    log "Trimmed FASTQ files are in: ${BASE_DIR}/data/trimmed/"
+    log ""
+}
+
 process_all_samples() {
-    log "Processing all aligned samples..."
+    log "Processing all aligned samples sequentially..."
 
-    BAM_FILES=("${BASE_DIR}"/data/aligned/*.Aligned.sortedByCoord.out.bam)
-
-    if [ ${#BAM_FILES[@]} -eq 0 ]; then
-        log_error "No aligned BAM files found in ${BASE_DIR}/data/aligned/"
+    if [ ${#SRA_LIST[@]} -eq 0 ]; then
+        load_sra_ids
     fi
 
-    if command -v parallel &> /dev/null; then
-        printf "%s\n" "${BAM_FILES[@]}" | \
-        parallel -j ${MAX_PARALLEL} --progress --bar \
-            'sample=$(basename {} .Aligned.sortedByCoord.out.bam); \
-             '"$0"' process-single "$sample" "{}"'
-    else
-        for bam_file in "${BAM_FILES[@]}"; do
-            sample=$(basename "${bam_file}" .Aligned.sortedByCoord.out.bam)
-            process_sample "${sample}" "${bam_file}" &
-        done
-        wait
-    fi
+    for SRR in "${SRA_LIST[@]}"; do
+        log "========================================"
+        log "Processing sample: ${SRR}"
+        log "========================================"
+
+        check_disk_space 2048 || log_warning "Low disk space, continuing anyway"
+
+        # Find the BAM file for this sample
+        BAM_FILE="${BASE_DIR}/data/aligned/${SRR}.Aligned.sortedByCoord.out.bam"
+
+        if [ ! -f "${BAM_FILE}" ]; then
+            log_warning "BAM file not found for ${SRR}, skipping: ${BAM_FILE}"
+            continue
+        fi
+
+        # Process single sample
+        process_sample "${SRR}" "${BAM_FILE}"
+
+        # Cleanup intermediate files for this sample
+        cleanup_intermediate "${SRR}" "${KEEP_INTERMEDIATE}"
+
+        log "Completed processing for ${SRR}"
+    done
 
     log "Merging all TSV files..."
     MERGED_TSV="${BASE_DIR}/all_samples.tsv"
@@ -1615,73 +2154,6 @@ process_all_samples() {
 }
 
 ############################################################
-# Main Pipeline Functions
-############################################################
-
-run_fastq_pipeline() {
-    log "Starting FASTQ processing pipeline"
-
-    setup_environment
-
-    if [ ${#SRA_LIST[@]} -eq 0 ]; then
-        load_sra_ids
-    fi
-
-    if [ ${#SRA_LIST[@]} -eq 0 ]; then
-        log_error "No SRA IDs to process"
-    fi
-
-    download_sra_files
-    validate_sra_files
-    extract_fastq
-    run_fastqc
-    trim_reads
-    run_fastqc_trimmed
-
-    log ""
-    log "========================================"
-    log "FASTQ Processing Complete!"
-    log "========================================"
-    log ""
-    log "Next steps:"
-    log "1. Align the trimmed FASTQ files with STAR"
-    log "2. Run: ./$(basename "$0") run"
-    log ""
-    log "Trimmed FASTQ files are in: ${BASE_DIR}/data/trimmed/"
-    log ""
-}
-
-run_full_pipeline() {
-    log "Starting full MDD2 SNP Extraction Pipeline"
-
-    setup_environment
-
-    if [ ${#SRA_LIST[@]} -eq 0 ]; then
-        load_sra_ids
-    fi
-
-    if [ ${#SRA_LIST[@]} -eq 0 ]; then
-        log_error "No SRA IDs to process"
-    fi
-
-    run_fastq_pipeline
-    align_with_star
-    process_all_samples
-
-    log ""
-    log "========================================"
-    log "Pipeline Complete!"
-    log "========================================"
-    log ""
-    log "Output files:"
-    log "  • Merged TSV: ${BASE_DIR}/all_samples.tsv.gz"
-    log "  • Individual TSVs: ${BASE_DIR}/data/tsv/"
-    log "  • VCF files: ${BASE_DIR}/data/vcf/"
-    log "  • Processed BAMs: ${BASE_DIR}/data/processed/"
-    log ""
-}
-
-############################################################
 # Main Script Entry Point
 ############################################################
 
@@ -1691,7 +2163,7 @@ show_help() {
 MDD2 SNP Extraction Pipeline v3.0
 ========================================
 
-Usage: $0 [command]
+Usage: $0 [--keep-intermediate] <command>
 
 Commands:
   install         - Install all required tools locally
@@ -1699,23 +2171,34 @@ Commands:
   load-ids        - Load SRA IDs from Excel file (will prompt for file)
   fastq           - Run FASTQ processing pipeline (download, trim, QC)
   align           - Align trimmed FASTQ with STAR
-  run             - Run full pipeline
+  run             - Run full pipeline sequentially with cleanup
   process-single <sample> <bam> - Process single aligned BAM file
   process-all     - Process all aligned samples in parallel
   test            - Run test with sample data
   clean           - Clean intermediate files
   help            - Show this help message
 
+Options:
+  --keep-intermediate  Keep intermediate files (SRA, FASTQ, temporary BAMs)
+                      Default: Files are deleted after each sample is processed
+
 Example workflow:
   1. $0 install      # Install tools locally in ~/.local/mdd2_tools
   2. $0 setup        # Download reference files
   3. $0 load-ids     # Load SRA IDs from Excel
-  4. $0 fastq        # Process FASTQ files
-  5. $0 align        # Align with STAR
-  6. $0 run          # Complete analysis
+  4. $0 run          # Run complete sequential pipeline
+  5. $0 run --keep-intermediate  # Keep intermediate files for debugging
+
+Sequential Processing:
+  • Processes one sample at a time: Download → Process → Cleanup → Next
+  • Automatically checks disk space before each download
+  • Keeps only essential files: TSV, VCF, final BAM, QC reports
+  • Deletes intermediate files by default (SRA, FASTQ, temp BAMs)
+  • Use --keep-intermediate flag to retain all intermediate files
 
 Features:
-  • Parallel downloading/extraction with GNU parallel
+  • Sequential processing for large datasets (hundreds of samples)
+  • Automatic disk space management
   • Excel file integration with automatic SRA ID extraction
   • GPU acceleration support for GATK and STAR
   • Multi-core processing throughout pipeline
@@ -1730,10 +2213,19 @@ Configuration:
 Output:
   • Tools installed to: ${TOOLS_DIR}
   • Analysis results in: ${BASE_DIR}
+  • Final merged TSV: ${BASE_DIR}/all_samples.tsv.gz
 EOF
 }
 
 # Main command dispatch
+KEEP_INTERMEDIATE=false
+
+# Check for --keep-intermediate flag
+if [ $# -gt 0 ] && [[ "$1" == "--keep-intermediate" ]]; then
+    KEEP_INTERMEDIATE=true
+    shift
+fi
+
 if [ $# -eq 0 ]; then
     show_help
     exit 0
@@ -1764,23 +2256,29 @@ case "${COMMAND}" in
         ;;
     "process-single")
         if [ $# -ne 2 ]; then
-            echo "Usage: $0 process-single <sample> <bam>"
+            echo "Usage: $0 [--keep-intermediate] process-single <sample> <bam>"
             exit 1
         fi
         setup_environment
+        export KEEP_INTERMEDIATE
         process_sample "$1" "$2"
         ;;
     "process-all")
         setup_environment
+        export KEEP_INTERMEDIATE
         process_all_samples
         ;;
     "test")
         log "Running test with sample data..."
         SRA_LIST=("SRR5961857" "SRR5961858")
         setup_environment
-        download_sra_files
-        extract_fastq
-        run_fastqc
+        export KEEP_INTERMEDIATE
+        # Test with sequential processing
+        for SRR in "${SRA_LIST[@]}"; do
+            download_single_sra "${SRR}"
+            extract_single_fastq "${SRR}"
+            cleanup_intermediate "${SRR}" "${KEEP_INTERMEDIATE}"
+        done
         log "Test completed successfully"
         ;;
     "clean")
@@ -1802,5 +2300,6 @@ case "${COMMAND}" in
         exit 1
         ;;
 esac
+
 
 log "Command completed: ${COMMAND}"
