@@ -1201,13 +1201,13 @@ align_single_sample() {
         star_gpu_opts="--runGPU"
     fi
 
+    # REMOVE the --outSAMattrRGline parameter - let GATK handle read groups
     STAR --runThreadN ${GATK_THREADS} \
          --genomeDir "${STAR_INDEX_DIR}" \
          --readFilesIn "${R1}" "${R2}" \
          --readFilesCommand zcat \
          --outFileNamePrefix "${BASE_DIR}/data/aligned/${SRR}." \
          --outSAMtype BAM SortedByCoordinate \
-         --outSAMattrRGline "ID:${SRR} SM:${SRR} LB:lib1 PL:ILLUMINA" \
          --outFilterMultimapNmax 20 \
          --alignSJoverhangMin 8 \
          --alignSJDBoverhangMin 1 \
@@ -1822,13 +1822,13 @@ align_with_star() {
             star_gpu_opts="--runGPU"
         fi
 
+        # REMOVE the --outSAMattrRGline parameter - let GATK handle read groups
         STAR --runThreadN ${GATK_THREADS} \
              --genomeDir "${STAR_INDEX_DIR}" \
              --readFilesIn "${R1}" "${R2}" \
              --readFilesCommand zcat \
              --outFileNamePrefix "${BASE_DIR}/data/aligned/${SRR}." \
              --outSAMtype BAM SortedByCoordOut \
-             --outSAMattrRGline "ID:${SRR} SM:${SRR} LB:lib1 PL:ILLUMINA" \
              --outFilterMultimapNmax 20 \
              --alignSJoverhangMin 8 \
              --alignSJDBoverhangMin 1 \
@@ -1846,6 +1846,7 @@ align_with_star() {
         fi
     done
 }
+
 ############################################################
 # GATK Processing (Complete from original)
 ############################################################
