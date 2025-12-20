@@ -25,6 +25,10 @@ mkdir -p "${BASE_DIR}/"{data,references,tools,logs}
 mkdir -p "${BASE_DIR}/data/"{sra,fastq,fastqc,trimmed,aligned,processed,vcf,tsv,tmp}
 mkdir -p "${BASE_DIR}/references/"{genome,annotations,known_sites}
 
+# Annotation options
+SKIP_FUNCOTATOR=false  # Set to true to skip Funcotator and use SnpEff instead
+FUNCOTATOR_DS="${BASE_DIR}/references/annotations/funcotator_dataSources"
+
 # Reference files
 REF_GENOME="${BASE_DIR}/references/genome/GRCh38.primary_assembly.genome.fa"
 REF_GENOME_URL="https://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_human/release_49/GRCh38.primary_assembly.genome.fa.gz"
@@ -46,9 +50,120 @@ EXCEL_FILE=""
 SRA_LIST_FILE="${BASE_DIR}/sra_ids.txt"
 SRA_LIST=()
 
+
 ############################################################
 # Logging Functions (Complete)
 ############################################################
+
+############################################################
+# File-based Resume Functions
+############################################################
+
+check_file_exists() {
+    local pattern="$1"
+    local count=$(find "${BASE_DIR}" -name "${pattern}" 2>/dev/null | wc -l)
+    [ "${count}" -gt 0 ] && return 0 || return 1
+}
+
+check_sample_file_exists() {
+    local SRR="$1"
+    local pattern="$2"
+    local file
+
+    case "${pattern}" in
+        "sra")
+            if find_sra_file "${SRR}" > /dev/null; then
+                echo "$(find_sra_file "${SRR}")"
+                return 0
+            fi
+            ;;
+        "fastq1")
+            file="${BASE_DIR}/data/fastq/${SRR}_1.fastq.gz"
+            [ -f "${file}" ] && echo "${file}" && return 0
+            ;;
+        "fastq2")
+            file="${BASE_DIR}/data/fastq/${SRR}_2.fastq.gz"
+            [ -f "${file}" ] && echo "${file}" && return 0
+            ;;
+        "trimmed1")
+            file="${BASE_DIR}/data/trimmed/${SRR}_1.paired.fastq.gz"
+            [ -f "${file}" ] && echo "${file}" && return 0
+            ;;
+        "trimmed2")
+            file="${BASE_DIR}/data/trimmed/${SRR}_2.paired.fastq.gz"
+            [ -f "${file}" ] && echo "${file}" && return 0
+            ;;
+        "bam")
+            file="${BASE_DIR}/data/aligned/${SRR}.Aligned.sortedByCoord.out.bam"
+            [ -f "${file}" ] && echo "${file}" && return 0
+            ;;
+        "bai")
+            file="${BASE_DIR}/data/aligned/${SRR}.Aligned.sortedByCoord.out.bam.bai"
+            [ -f "${file}" ] && echo "${file}" && return 0
+            ;;
+        "tsv")
+            file="${BASE_DIR}/data/tsv/${SRR}/${SRR}.tsv.gz"
+            [ -f "${file}" ] && echo "${file}" && return 0
+            ;;
+        "vcf")
+            file="${BASE_DIR}/data/vcf/${SRR}/${SRR}.genes.vcf.gz"
+            [ -f "${file}" ] && echo "${file}" && return 0
+            ;;
+    esac
+
+    return 1
+}
+
+get_sample_status() {
+    local SRR="$1"
+
+    # Check each step in reverse order (most complete first)
+    if check_sample_file_exists "${SRR}" "tsv" > /dev/null && \
+       check_sample_file_exists "${SRR}" "vcf" > /dev/null; then
+        echo "completed"
+        return 0
+    fi
+
+    if check_sample_file_exists "${SRR}" "bam" > /dev/null && \
+       check_sample_file_exists "${SRR}" "bai" > /dev/null; then
+        echo "aligned"
+        return 0
+    fi
+
+    if check_sample_file_exists "${SRR}" "trimmed1" > /dev/null && \
+       check_sample_file_exists "${SRR}" "trimmed2" > /dev/null; then
+        echo "trimmed"
+        return 0
+    fi
+
+    if check_sample_file_exists "${SRR}" "fastq1" > /dev/null && \
+       check_sample_file_exists "${SRR}" "fastq2" > /dev/null; then
+        echo "extracted"
+        return 0
+    fi
+
+    if check_sample_file_exists "${SRR}" "sra" > /dev/null; then
+        echo "downloaded"
+        return 0
+    fi
+
+    echo "not_started"
+}
+
+get_next_step_for_sample() {
+    local SRR="$1"
+    local status=$(get_sample_status "${SRR}")
+
+    case "${status}" in
+        "not_started") echo "download" ;;
+        "downloaded") echo "extract" ;;
+        "extracted") echo "trim" ;;
+        "trimmed") echo "align" ;;
+        "aligned") echo "process" ;;
+        "completed") echo "done" ;;
+        *) echo "unknown" ;;
+    esac
+}
 
 log() {
     local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
@@ -915,14 +1030,73 @@ download_funcotator() {
 
     mkdir -p "${FUNCOTATOR_DS}"
 
-    $GATK FuncotatorDataSourceDownloader \
-        --somatic \
-        --hg38 \
-        --validate-integrity \
-        --extract-after-download \
-        --output "${FUNCOTATOR_DS}"
+    # Check if already downloaded
+    if [ -d "${FUNCOTATOR_DS}" ] && [ "$(ls -A "${FUNCOTATOR_DS}" 2>/dev/null | wc -l)" -gt 10 ]; then
+        log "Funcotator data sources already exist at: ${FUNCOTATOR_DS}"
+        return 0
+    fi
 
-    log "Funcotator data sources downloaded to: ${FUNCOTATOR_DS}"
+    log "This may take a while (downloading ~30GB of data)..."
+    log "You can also download manually from:"
+    log "  https://console.cloud.google.com/storage/browser/gatk-best-practices/funcotator"
+
+    # Try different download methods
+    if [ -x "${GATK}" ] || command -v gatk &> /dev/null; then
+        GATK_CMD="${GATK:-gatk}"
+
+        # Try with somatic databases first (smaller)
+        log "Attempting to download somatic data sources..."
+        if $GATK_CMD FuncotatorDataSourceDownloader \
+            --somatic \
+            --hg38 \
+            --validate-integrity \
+            --extract-after-download \
+            --output "${FUNCOTATOR_DS}" 2>&1 | tee -a "${BASE_DIR}/logs/funcotator.log"; then
+            log "Somatic data sources downloaded successfully"
+            return 0
+        fi
+
+        # Try without validation
+        log "Trying without validation..."
+        if $GATK_CMD FuncotatorDataSourceDownloader \
+            --somatic \
+            --hg38 \
+            --extract-after-download \
+            --output "${FUNCOTATOR_DS}" 2>&1 | tee -a "${BASE_DIR}/logs/funcotator.log"; then
+            log "Somatic data sources downloaded (without validation)"
+            return 0
+        fi
+
+        # Try germline
+        log "Trying germline data sources..."
+        if $GATK_CMD FuncotatorDataSourceDownloader \
+            --germline \
+            --hg38 \
+            --extract-after-download \
+            --output "${FUNCOTATOR_DS}" 2>&1 | tee -a "${BASE_DIR}/logs/funcotator.log"; then
+            log "Germline data sources downloaded"
+            return 0
+        fi
+    fi
+
+    # Manual download option
+    log_warning "Automatic Funcotator download failed."
+    log "You need to manually download and extract funcotator data sources:"
+    log ""
+    log "Option 1: Download from Google Cloud Storage:"
+    log "  mkdir -p ${FUNCOTATOR_DS}"
+    log "  cd ${FUNCOTATOR_DS}"
+    log "  gsutil -m cp -r gs://gatk-best-practices/funcotator/dataSources.v1.7.20200521g/* ."
+    log ""
+    log "Option 2: Use pre-downloaded tarball:"
+    log "  wget https://storage.googleapis.com/gatk-best-practices/funcotator/funcotator_dataSources.v1.7.20200521g.tar.gz"
+    log "  tar -xzf funcotator_dataSources.v1.7.20200521g.tar.gz -C ${FUNCOTATOR_DS}"
+    log ""
+    log "Option 3: Skip Funcotator annotation (less comprehensive):"
+    log "  Set SKIP_FUNCOTATOR=true in script configuration"
+    log ""
+
+    return 1
 }
 
 setup_references() {
@@ -1137,6 +1311,19 @@ trim_single_sample() {
     local SRR="$1"
     local INPUT_DIR="${BASE_DIR}/data/fastq"
 
+    # Skip if trimmed files already exist
+    if TRIMMED1=$(check_sample_file_exists "${SRR}" "trimmed1") && \
+       TRIMMED2=$(check_sample_file_exists "${SRR}" "trimmed2"); then
+        log "Trimmed files already exist: ${TRIMMED1}, ${TRIMMED2}, skipping trim..."
+        return 0
+    fi
+
+    # Need FASTQ files
+    if ! FASTQ1=$(check_sample_file_exists "${SRR}" "fastq1") || \
+       ! FASTQ2=$(check_sample_file_exists "${SRR}" "fastq2"); then
+        log_error "FASTQ files not found for ${SRR}, cannot trim"
+    fi
+
     if [ ! -f "${TRIMMOMATIC_JAR}" ] && [ ! -f "${TOOLS_DIR}/Trimmomatic-0.39/trimmomatic-0.39.jar" ]; then
         log "Trimmomatic not found, skipping trim for ${SRR}"
         return 0
@@ -1180,6 +1367,24 @@ trim_single_sample() {
 
 align_single_sample() {
     local SRR="$1"
+
+    # Skip if BAM already exists
+    if BAM_FILE=$(check_sample_file_exists "${SRR}" "bam"); then
+        log "BAM file already exists: ${BAM_FILE}"
+
+        # Check if index exists, create if missing
+        if ! check_sample_file_exists "${SRR}" "bai" > /dev/null; then
+            log "Creating missing BAM index..."
+            samtools index "${BAM_FILE}"
+        fi
+        return 0
+    fi
+
+    # Need trimmed files
+    if ! TRIMMED1=$(check_sample_file_exists "${SRR}" "trimmed1") || \
+       ! TRIMMED2=$(check_sample_file_exists "${SRR}" "trimmed2"); then
+        log_error "Trimmed FASTQ files not found for ${SRR}, cannot align"
+    fi
 
     # Check if STAR index exists (check for SA file, not just directory)
     if [ ! -f "${STAR_INDEX_DIR}/SA" ]; then
@@ -1228,7 +1433,11 @@ align_single_sample() {
 download_single_sra() {
     local SRR="$1"
     log "Downloading ${SRR}..."
-
+    # Skip if already downloaded
+    if SRA_FILE=$(check_sample_file_exists "${SRR}" "sra"); then
+        log "SRA file already exists: ${SRA_FILE}, skipping download..."
+        return 0
+    fi
     mkdir -p "${BASE_DIR}/data/sra/"
 
     if SRA_FILE=$(find_sra_file "${SRR}"); then
@@ -1281,6 +1490,13 @@ extract_single_fastq() {
     local SRR="$1"
     log "Splitting ${SRR} into FASTQ..."
     mkdir -p "${BASE_DIR}/data/fastq/"
+
+    # Skip if FASTQ already exists
+    if FASTQ1=$(check_sample_file_exists "${SRR}" "fastq1") && \
+       FASTQ2=$(check_sample_file_exists "${SRR}" "fastq2"); then
+        log "FASTQ files already exist: ${FASTQ1}, ${FASTQ2}, skipping extraction..."
+        return 0
+    fi
 
     if ! SRA_FILE=$(find_sra_file "${SRR}"); then
         log_error "${SRR}.sra not found, cannot extract FASTQ"
@@ -1360,7 +1576,7 @@ check_disk_space() {
 }
 
 run_full_pipeline() {
-    log "Starting full MDD2 SNP Extraction Pipeline"
+    log "Starting full MDD2 SNP Extraction Pipeline with auto-resume"
     setup_environment
 
     if [ ${#SRA_LIST[@]} -eq 0 ]; then
@@ -1371,93 +1587,162 @@ run_full_pipeline() {
         log_error "No SRA IDs to process"
     fi
 
-    log "Processing ${#SRA_LIST[@]} samples sequentially with cleanup..."
+    log "Processing ${#SRA_LIST[@]} samples (will skip completed steps)..."
 
-    # Process each sample completely before moving to next
+    COMPLETED_SAMPLES=0
+    SKIPPED_SAMPLES=0
+    PROCESSED_SAMPLES=0
+    FAILED_SAMPLES=0
+
     for SRR in "${SRA_LIST[@]}"; do
         log "========================================"
-        log "Processing FULL pipeline for: ${SRR}"
+        log "Sample: ${SRR}"
         log "========================================"
 
-        check_disk_space 5120
+        status=$(get_sample_status "${SRR}")
+        log "Current status: ${status}"
 
-        # FASTQ steps
-        download_single_sra "${SRR}"
-        validate_single_sra "${SRR}"
-        extract_single_fastq "${SRR}"
-
-        # Immediate cleanup of SRA file
-        if [ "${KEEP_INTERMEDIATE}" != "true" ]; then
-            rm -f "${BASE_DIR}/data/sra/${SRR}.sra" 2>/dev/null || true
+        # If already completed, skip
+        if [ "${status}" = "completed" ]; then
+            log "✓ Already completed, skipping..."
+            SKIPPED_SAMPLES=$((SKIPPED_SAMPLES + 1))
+            continue
         fi
 
-        # FASTQC for this sample
-        log "Running FastQC for ${SRR}..."
-        if [ -f "${BASE_DIR}/data/fastq/${SRR}_1.fastq.gz" ]; then
-            fastqc "${BASE_DIR}/data/fastq/${SRR}_1.fastq.gz" -o "${BASE_DIR}/data/fastqc/raw" --quiet 2>/dev/null || true
-        fi
-        if [ -f "${BASE_DIR}/data/fastq/${SRR}_2.fastq.gz" ]; then
-            fastqc "${BASE_DIR}/data/fastq/${SRR}_2.fastq.gz" -o "${BASE_DIR}/data/fastqc/raw" --quiet 2>/dev/null || true
-        fi
+        # Check disk space
+        check_disk_space 5120 || log_warning "Low disk space, continuing anyway"
 
-        # Trim this sample
-        log "Trimming ${SRR}..."
-        if [ -f "${TRIMMOMATIC_JAR}" ] || [ -f "${TOOLS_DIR}/Trimmomatic-0.39/trimmomatic-0.39.jar" ]; then
-            trim_single_sample "${SRR}"
-        fi
-
-        # Align this sample
-        log "Aligning ${SRR} with STAR..."
-        align_single_sample "${SRR}"
-
-        # Process this sample (variant calling)
-        BAM_FILE="${BASE_DIR}/data/aligned/${SRR}.Aligned.sortedByCoord.out.bam"
-        if [ -f "${BAM_FILE}" ]; then
-            process_sample "${SRR}" "${BAM_FILE}"
+        # Process based on current status
+        if process_sample_sequentially "${SRR}"; then
+            PROCESSED_SAMPLES=$((PROCESSED_SAMPLES + 1))
+            if [ "$(get_sample_status "${SRR}")" = "completed" ]; then
+                COMPLETED_SAMPLES=$((COMPLETED_SAMPLES + 1))
+            fi
+            log "Successfully progressed ${SRR}"
         else
-            log_warning "BAM file not found after alignment: ${BAM_FILE}"
+            FAILED_SAMPLES=$((FAILED_SAMPLES + 1))
+            log_warning "Failed to process ${SRR}, will retry on next run"
         fi
 
-        # Cleanup intermediate files for this sample
-        cleanup_intermediate "${SRR}" "${KEEP_INTERMEDIATE}"
-
-        log "Completed FULL processing for ${SRR}"
+        log "Progress: ${COMPLETED_SAMPLES} completed, ${SKIPPED_SAMPLES} skipped, ${PROCESSED_SAMPLES} processed this run"
     done
-
-    # Run MultiQC on all QC data
-    if command -v multiqc &> /dev/null; then
-        log "Running final MultiQC..."
-        multiqc "${BASE_DIR}/data/fastqc/" -o "${BASE_DIR}/data/fastqc/" --quiet
-    fi
 
     # Merge all TSV files
-    log "Merging all TSV files..."
-    MERGED_TSV="${BASE_DIR}/all_samples.tsv"
-    echo -e "CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tGENE\tGT\tDP\tAD\tGQ\tSAMPLE" > "${MERGED_TSV}"
-
-    for sample_dir in "${BASE_DIR}/data/tsv/"*/; do
-        sample=$(basename "${sample_dir}")
-        tsv_gz="${sample_dir}/${sample}.tsv.gz"
-        if [ -f "${tsv_gz}" ]; then
-            pigz -dc "${tsv_gz}" 2>/dev/null | tail -n +2 | awk -v sample="${sample}" '{print $0 "\t" sample}' >> "${MERGED_TSV}" || \
-            gzip -dc "${tsv_gz}" | tail -n +2 | awk -v sample="${sample}" '{print $0 "\t" sample}' >> "${MERGED_TSV}"
-        fi
-    done
-
-    pigz -f -p 4 "${MERGED_TSV}" 2>/dev/null || gzip -f "${MERGED_TSV}"
+    merge_all_tsv_files_simple
 
     log ""
     log "========================================"
-    log "Pipeline Complete!"
+    log "Pipeline Run Complete!"
     log "========================================"
+    log "Summary:"
+    log "  • Total samples: ${#SRA_LIST[@]}"
+    log "  • Completed (now): ${COMPLETED_SAMPLES}"
+    log "  • Skipped (already done): ${SKIPPED_SAMPLES}"
+    log "  • Processed this run: ${PROCESSED_SAMPLES}"
+    log "  • Failed this run: ${FAILED_SAMPLES}"
     log ""
     log "Output files:"
     log "  • Merged TSV: ${BASE_DIR}/all_samples.tsv.gz"
-    log "  • Individual TSVs: ${BASE_DIR}/data/tsv/"
-    log "  • VCF files: ${BASE_DIR}/data/vcf/"
-    log "  • Processed BAMs: ${BASE_DIR}/data/processed/"
-    log "  • QC reports: ${BASE_DIR}/data/fastqc/"
+    log "  • Individual results: ${BASE_DIR}/data/tsv/"
     log ""
+    log "Run again to resume any failed/incomplete samples"
+    log ""
+}
+
+process_sample_sequentially() {
+    local SRR="$1"
+
+    log "Processing ${SRR} sequentially with auto-resume..."
+
+    # Step 1: Download (if needed)
+    if ! check_sample_file_exists "${SRR}" "sra" > /dev/null; then
+        log "Step 1: Downloading SRA..."
+        download_single_sra "${SRR}" || return 1
+    else
+        log "Step 1: SRA already downloaded, skipping..."
+    fi
+
+    # Step 2: Extract FASTQ (if needed)
+    if ! check_sample_file_exists "${SRR}" "fastq1" > /dev/null || \
+       ! check_sample_file_exists "${SRR}" "fastq2" > /dev/null; then
+        log "Step 2: Extracting FASTQ..."
+        extract_single_fastq "${SRR}" || return 1
+    else
+        log "Step 2: FASTQ already extracted, skipping..."
+    fi
+
+    # Step 3: Run FastQC on raw files (always run, quick)
+    log "Step 3: Running FastQC on raw FASTQ..."
+    run_fastqc_single "${SRR}" "raw"
+
+    # Step 4: Trim (if needed)
+    if ! check_sample_file_exists "${SRR}" "trimmed1" > /dev/null || \
+       ! check_sample_file_exists "${SRR}" "trimmed2" > /dev/null; then
+        log "Step 4: Trimming..."
+        trim_single_sample "${SRR}" || return 1
+    else
+        log "Step 4: Already trimmed, skipping..."
+    fi
+
+    # Step 5: Run FastQC on trimmed files
+    log "Step 5: Running FastQC on trimmed FASTQ..."
+    run_fastqc_single "${SRR}" "trimmed"
+
+    # Step 6: Align (if needed)
+    if ! check_sample_file_exists "${SRR}" "bam" > /dev/null; then
+        log "Step 6: Aligning with STAR..."
+        align_single_sample "${SRR}" || return 1
+    else
+        log "Step 6: Already aligned, skipping..."
+    fi
+
+    # Step 7: Process (variant calling, if needed)
+    if ! check_sample_file_exists "${SRR}" "tsv" > /dev/null || \
+       ! check_sample_file_exists "${SRR}" "vcf" > /dev/null; then
+        log "Step 7: Variant calling and annotation..."
+        BAM_FILE="${BASE_DIR}/data/aligned/${SRR}.Aligned.sortedByCoord.out.bam"
+        if [ -f "${BAM_FILE}" ]; then
+            process_sample "${SRR}" "${BAM_FILE}" || return 1
+        else
+            log_error "BAM file not found: ${BAM_FILE}"
+            return 1
+        fi
+    else
+        log "Step 7: Already processed, skipping..."
+    fi
+
+    # Step 8: Cleanup (if not keeping intermediates)
+    if [ "${KEEP_INTERMEDIATE}" != "true" ]; then
+        log "Step 8: Cleaning up intermediate files..."
+        cleanup_intermediate "${SRR}" "${KEEP_INTERMEDIATE}"
+    fi
+
+    log "✓ Successfully processed ${SRR}"
+    return 0
+}
+
+run_fastqc_single() {
+    local SRR="$1"
+    local TYPE="$2"  # "raw" or "trimmed"
+
+    mkdir -p "${BASE_DIR}/data/fastqc/${TYPE}"
+
+    if [ "${TYPE}" = "raw" ]; then
+        R1="${BASE_DIR}/data/fastq/${SRR}_1.fastq.gz"
+        R2="${BASE_DIR}/data/fastq/${SRR}_2.fastq.gz"
+    else
+        R1="${BASE_DIR}/data/trimmed/${SRR}_1.paired.fastq.gz"
+        R2="${BASE_DIR}/data/trimmed/${SRR}_2.paired.fastq.gz"
+    fi
+
+    # Run FastQC only if output doesn't exist
+    if [ -f "${R1}" ] && [ ! -f "${BASE_DIR}/data/fastqc/${TYPE}/$(basename "${R1}" .fastq.gz)_fastqc.html" ]; then
+        fastqc "${R1}" -o "${BASE_DIR}/data/fastqc/${TYPE}" --quiet 2>/dev/null || true
+    fi
+
+    if [ -f "${R2}" ] && [ ! -f "${BASE_DIR}/data/fastqc/${TYPE}/$(basename "${R2}" .fastq.gz)_fastqc.html" ]; then
+        fastqc "${R2}" -o "${BASE_DIR}/data/fastqc/${TYPE}" --quiet 2>/dev/null || true
+    fi
 }
 
 run_fastq_pipeline() {
@@ -1510,6 +1795,114 @@ run_fastq_pipeline() {
     log "Trimmed FASTQ files are in: ${BASE_DIR}/data/trimmed/"
     log ""
 }
+
+merge_all_tsv_files_simple() {
+    log "Merging all TSV files..."
+
+    MERGED_TSV="${BASE_DIR}/all_samples.tsv"
+
+    # Create header
+    echo -e "CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tGENE\tGT\tDP\tAD\tGQ\tSAMPLE" > "${MERGED_TSV}"
+
+    # Find and merge all TSV files
+    TSV_FILES=0
+
+    for tsv_gz in "${BASE_DIR}/data/tsv/"*/*.tsv.gz; do
+        if [ -f "${tsv_gz}" ]; then
+            TSV_FILES=$((TSV_FILES + 1))
+            sample=$(basename "${tsv_gz}" .tsv.gz)
+            log "Adding ${sample}..."
+
+            # Use appropriate decompression
+            if command -v pigz > /dev/null; then
+                pigz -dc "${tsv_gz}" 2>/dev/null | tail -n +2 | awk -v sample="${sample}" '{print $0 "\t" sample}' >> "${MERGED_TSV}"
+            else
+                gzip -dc "${tsv_gz}" | tail -n +2 | awk -v sample="${sample}" '{print $0 "\t" sample}' >> "${MERGED_TSV}"
+            fi
+        fi
+    done
+
+    if [ "${TSV_FILES}" -eq 0 ]; then
+        log_warning "No TSV files found to merge"
+        rm -f "${MERGED_TSV}"
+        return 0
+    fi
+
+    # Compress output
+    if [ -f "${MERGED_TSV}" ] && [ -s "${MERGED_TSV}" ]; then
+        if command -v pigz > /dev/null; then
+            pigz -f -p 4 "${MERGED_TSV}"
+        else
+            gzip -f "${MERGED_TSV}"
+        fi
+        log "Merged ${TSV_FILES} samples into: ${MERGED_TSV}.gz"
+    else
+        log_warning "Merged TSV file is empty"
+    fi
+}
+
+show_pipeline_status_simple() {
+    log "Pipeline Status (File-based)"
+    log "============================="
+
+    if [ ${#SRA_LIST[@]} -eq 0 ]; then
+        load_sra_ids
+    fi
+
+    TOTAL=${#SRA_LIST[@]}
+    COMPLETED=0
+    PARTIAL=0
+    NOT_STARTED=0
+
+    echo ""
+    echo "Sample Status:"
+    echo "--------------"
+
+    for SRR in "${SRA_LIST[@]}"; do
+        status=$(get_sample_status "${SRR}")
+
+        case "${status}" in
+            "completed")
+                COMPLETED=$((COMPLETED + 1))
+                echo "  ✓ ${SRR}: COMPLETED"
+                ;;
+            "aligned"|"trimmed"|"extracted"|"downloaded")
+                PARTIAL=$((PARTIAL + 1))
+                next_step=$(get_next_step_for_sample "${SRR}")
+                echo "  → ${SRR}: ${status} (next: ${next_step})"
+                ;;
+            "not_started")
+                NOT_STARTED=$((NOT_STARTED + 1))
+                echo "  ○ ${SRR}: NOT STARTED"
+                ;;
+            *)
+                echo "  ? ${SRR}: ${status}"
+                ;;
+        esac
+    done
+
+    echo ""
+    echo "Summary:"
+    echo "  Total samples: ${TOTAL}"
+    echo "  Completed: ${COMPLETED} ($((COMPLETED * 100 / TOTAL))%)"
+    echo "  Partially done: ${PARTIAL}"
+    echo "  Not started: ${NOT_STARTED}"
+    echo ""
+
+    # Show file counts
+    echo "File Counts:"
+    echo "  SRA files: $(find "${BASE_DIR}/data/sra/" -name "*.sra" 2>/dev/null | wc -l)"
+    echo "  FASTQ pairs: $(find "${BASE_DIR}/data/fastq/" -name "*_1.fastq.gz" 2>/dev/null | wc -l)"
+    echo "  Trimmed pairs: $(find "${BASE_DIR}/data/trimmed/" -name "*_1.paired.fastq.gz" 2>/dev/null | wc -l)"
+    echo "  BAM files: $(find "${BASE_DIR}/data/aligned/" -name "*.Aligned.sortedByCoord.out.bam" 2>/dev/null | wc -l)"
+    echo "  TSV files: $(find "${BASE_DIR}/data/tsv/" -name "*.tsv.gz" 2>/dev/null | wc -l)"
+    echo ""
+
+    # Disk space
+    echo "Disk Usage:"
+    du -sh "${BASE_DIR}/data/"* 2>/dev/null | sort -hr | head -10
+}
+
 
 ############################################################
 # Pipeline Steps (Complete from original)
@@ -1851,9 +2244,28 @@ align_with_star() {
 # GATK Processing (Complete from original)
 ############################################################
 
-process_sample() {
+process_sample_DNA() {
     local SAMPLE=$1
     local INPUT_BAM=$2
+
+    # Ensure gene BED file exists
+    GENE_BED_GZ="${BASE_DIR}/references/annotations/genes.bed.gz"
+    GENE_BED_HDR="${BASE_DIR}/references/annotations/genes.bed.hdr"
+
+    if [ ! -f "${GENE_BED_GZ}" ] || [ ! -f "${GENE_BED_HDR}" ]; then
+        log_warning "Gene BED file not found, generating..."
+        generate_gene_bed
+    fi
+
+    # Skip if already processed
+    if TSV_FILE=$(check_sample_file_exists "${SAMPLE}" "tsv") && \
+       VCF_FILE=$(check_sample_file_exists "${SAMPLE}" "vcf"); then
+        log "Sample ${SAMPLE} already processed:"
+        log "  TSV: ${TSV_FILE}"
+        log "  VCF: ${VCF_FILE}"
+        log "Skipping processing..."
+        return 0
+    fi
 
     log "Processing sample: ${SAMPLE}"
 
@@ -1874,131 +2286,740 @@ process_sample() {
         fi
     fi
 
-    ##################################
-    # Add/Replace Read Groups
-    ##################################
-    log "Adding read groups..."
-    $GATK AddOrReplaceReadGroups \
-        -I "${INPUT_BAM}" \
-        -O "${BAM_DIR}/${SAMPLE}.rg.bam" \
-        -RGID "${SAMPLE}" \
-        -RGLB lib1 \
-        -RGPL ILLUMINA \
-        -RGPU "${SAMPLE}.unit1" \
-        -RGSM "${SAMPLE}" \
-        --CREATE_INDEX true
+    # Check if Funcotator is available
+    if [ ! -d "${FUNCOTATOR_DS}" ] || [ -z "$(ls -A "${FUNCOTATOR_DS}" 2>/dev/null)" ]; then
+        log_warning "Funcotator data sources not found at: ${FUNCOTATOR_DS}"
+        log "Will use SnpEff for annotation instead"
+        export SKIP_FUNCOTATOR=true
+    fi
 
     ##################################
-    # Mark Duplicates
+    # 1. Add/Replace Read Groups
     ##################################
-    log "Marking duplicates..."
-    $GATK MarkDuplicates \
-        -I "${BAM_DIR}/${SAMPLE}.rg.bam" \
-        -O "${BAM_DIR}/${SAMPLE}.rmdup.bam" \
-        -M "${BAM_DIR}/${SAMPLE}.rmdup.metrics.txt" \
-        --CREATE_INDEX true
+    RG_BAM="${BAM_DIR}/${SAMPLE}.rg.bam"
+    RG_BAI="${BAM_DIR}/${SAMPLE}.rg.bam.bai"
+
+    if [ -f "${RG_BAM}" ] && [ -f "${RG_BAI}" ]; then
+        log "Read groups already added: ${RG_BAM}"
+    else
+        log "Adding read groups..."
+        $GATK AddOrReplaceReadGroups \
+            -I "${INPUT_BAM}" \
+            -O "${RG_BAM}" \
+            -RGID "${SAMPLE}" \
+            -RGLB lib1 \
+            -RGPL ILLUMINA \
+            -RGPU "${SAMPLE}.unit1" \
+            -RGSM "${SAMPLE}" \
+            --CREATE_INDEX true
+    fi
 
     ##################################
-    # SplitNCigarReads
+    # 2. Mark Duplicates
     ##################################
-    log "Splitting N Cigar reads..."
-    $GATK SplitNCigarReads \
-        -R "${REF_GENOME}" \
-        -I "${BAM_DIR}/${SAMPLE}.rmdup.bam" \
-        -O "${BAM_DIR}/${SAMPLE}.split.bam" \
-        --create-output-bam-index true
+    RMDUP_BAM="${BAM_DIR}/${SAMPLE}.rmdup.bam"
+    RMDUP_BAI="${BAM_DIR}/${SAMPLE}.rmdup.bam.bai"
+
+    if [ -f "${RMDUP_BAM}" ] && [ -f "${RMDUP_BAI}" ]; then
+        log "Duplicates already marked: ${RMDUP_BAM}"
+    else
+        log "Marking duplicates..."
+        $GATK MarkDuplicates \
+            -I "${RG_BAM}" \
+            -O "${RMDUP_BAM}" \
+            -M "${BAM_DIR}/${SAMPLE}.rmdup.metrics.txt" \
+            --CREATE_INDEX true
+    fi
 
     ##################################
-    # Base Quality Score Recalibration
+    # 3. SplitNCigarReads
     ##################################
-    log "Running BaseRecalibrator..."
-    $GATK BaseRecalibrator \
-        -R "${REF_GENOME}" \
-        -I "${BAM_DIR}/${SAMPLE}.split.bam" \
-        --known-sites "${DBSNP}" \
-        --known-sites "${MILLS}" \
-        -O "${BAM_DIR}/${SAMPLE}.recal.table"
+    SPLIT_BAM="${BAM_DIR}/${SAMPLE}.split.bam"
+    SPLIT_BAI="${BAM_DIR}/${SAMPLE}.split.bam.bai"
 
-    log "Applying BQSR..."
-    $GATK ApplyBQSR \
-        -R "${REF_GENOME}" \
-        -I "${BAM_DIR}/${SAMPLE}.split.bam" \
-        --bqsr-recal-file "${BAM_DIR}/${SAMPLE}.recal.table" \
-        -O "${BAM_DIR}/${SAMPLE}.recal.bam" \
-        --create-output-bam-index true
+    if [ -f "${SPLIT_BAM}" ] && [ -f "${SPLIT_BAI}" ]; then
+        log "N Cigar reads already split: ${SPLIT_BAM}"
+    else
+        log "Splitting N Cigar reads..."
+        $GATK SplitNCigarReads \
+            -R "${REF_GENOME}" \
+            -I "${RMDUP_BAM}" \
+            -O "${SPLIT_BAM}" \
+            --create-output-bam-index true
+    fi
 
     ##################################
-    # Variant Calling
+    # 4. Base Quality Score Recalibration
     ##################################
-    log "Calling variants with HaplotypeCaller..."
-    $GATK HaplotypeCaller \
-        -R "${REF_GENOME}" \
-        -I "${BAM_DIR}/${SAMPLE}.recal.bam" \
-        -O "${VCF_DIR}/${SAMPLE}.vcf.gz" \
-        --dont-use-soft-clipped-bases \
-        --standard-min-confidence-threshold-for-calling 20.0
+    RECAL_TABLE="${BAM_DIR}/${SAMPLE}.recal.table"
+    RECAL_BAM="${BAM_DIR}/${SAMPLE}.recal.bam"
+    RECAL_BAI="${BAM_DIR}/${SAMPLE}.recal.bam.bai"
+
+    # Step 4a: Generate recalibration table
+    if [ -f "${RECAL_TABLE}" ]; then
+        log "Recalibration table already exists: ${RECAL_TABLE}"
+    else
+        log "Running BaseRecalibrator..."
+        $GATK BaseRecalibrator \
+            -R "${REF_GENOME}" \
+            -I "${SPLIT_BAM}" \
+            --known-sites "${DBSNP}" \
+            --known-sites "${MILLS}" \
+            -O "${RECAL_TABLE}"
+    fi
+
+    # Step 4b: Apply BQSR
+    if [ -f "${RECAL_BAM}" ] && [ -f "${RECAL_BAI}" ]; then
+        log "BQSR already applied: ${RECAL_BAM}"
+    else
+        log "Applying BQSR..."
+        $GATK ApplyBQSR \
+            -R "${REF_GENOME}" \
+            -I "${SPLIT_BAM}" \
+            --bqsr-recal-file "${RECAL_TABLE}" \
+            -O "${RECAL_BAM}" \
+            --create-output-bam-index true
+    fi
 
     ##################################
-    # Variant Filtration
+    # 5. Variant Calling
     ##################################
-    log "Filtering variants..."
-    $GATK VariantFiltration \
-        -R "${REF_GENOME}" \
-        -V "${VCF_DIR}/${SAMPLE}.vcf.gz" \
-        --filter-expression "QD < 2.0" --filter-name "LowQD" \
-        --filter-expression "FS > 30.0" --filter-name "FS" \
-        --filter-expression "SOR > 3.0" --filter-name "SOR" \
-        --filter-expression "MQ < 40.0" --filter-name "LowMQ" \
-        --filter-expression "MQRankSum < -12.5" --filter-name "MQRankSum" \
-        --filter-expression "ReadPosRankSum < -8.0" --filter-name "ReadPosRankSum" \
-        --window 35 --cluster 3 \
-        -O "${VCF_DIR}/${SAMPLE}.filtered.vcf.gz"
+    RAW_VCF="${VCF_DIR}/${SAMPLE}.vcf.gz"
 
-    ##################################
-    # Annotation
-    ##################################
-    log "Annotating with Funcotator..."
-    $GATK Funcotator \
-        -R "${REF_GENOME}" \
-        -V "${VCF_DIR}/${SAMPLE}.filtered.vcf.gz" \
-        -O "${VCF_DIR}/${SAMPLE}.annotated.vcf.gz" \
-        --ref-version hg38 \
-        --data-sources-path "${FUNCOTATOR_DS}" \
-        --output-file-format VCF
-
-    log "Adding dbSNP IDs..."
-    bcftools annotate \
-        -a "${DBSNP}" \
-        -c ID \
-        -O z \
-        -o "${VCF_DIR}/${SAMPLE}.rsID.vcf.gz" \
-        "${VCF_DIR}/${SAMPLE}.annotated.vcf.gz"
-
-    log "Adding gene annotations..."
-    bcftools annotate \
-        -a "${BASE_DIR}/references/annotations/genes.bed.gz" \
-        -h "${BASE_DIR}/references/annotations/genes.bed.hdr" \
-        -c CHROM,FROM,TO,INFO/GENE \
-        -O z \
-        -o "${VCF_DIR}/${SAMPLE}.genes.vcf.gz" \
-        "${VCF_DIR}/${SAMPLE}.rsID.vcf.gz"
+    if [ -f "${RAW_VCF}" ]; then
+        log "Variants already called: ${RAW_VCF}"
+    else
+        log "Calling variants with HaplotypeCaller..."
+        $GATK HaplotypeCaller \
+            -R "${REF_GENOME}" \
+            -I "${RECAL_BAM}" \
+            -O "${RAW_VCF}" \
+            --dont-use-soft-clipped-bases \
+            --standard-min-confidence-threshold-for-calling 20.0
+    fi
 
     ##################################
-    # TSV Export
+    # 6. Variant Filtration
     ##################################
-    log "Exporting to TSV..."
-    echo -e "CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tGENE\tGT\tDP\tAD\tGQ" > "${TSV_DIR}/${SAMPLE}.tsv"
+    FILTERED_VCF="${VCF_DIR}/${SAMPLE}.filtered.vcf.gz"
 
-    bcftools query \
-        -f '%CHROM\t%POS\t%ID\t%REF\t%ALT\t%QUAL\t%FILTER\t%INFO/GENE[\t%GT\t%DP\t%AD\t%GQ]\n' \
-        "${VCF_DIR}/${SAMPLE}.genes.vcf.gz" >> "${TSV_DIR}/${SAMPLE}.tsv"
+    if [ -f "${FILTERED_VCF}" ]; then
+        log "Variants already filtered: ${FILTERED_VCF}"
+    else
+        log "Filtering variants..."
+        $GATK VariantFiltration \
+            -R "${REF_GENOME}" \
+            -V "${RAW_VCF}" \
+            --filter-expression "QD < 2.0" --filter-name "LowQD" \
+            --filter-expression "FS > 30.0" --filter-name "FS" \
+            --filter-expression "SOR > 3.0" --filter-name "SOR" \
+            --filter-expression "MQ < 40.0" --filter-name "LowMQ" \
+            --filter-expression "MQRankSum < -12.5" --filter-name "MQRankSum" \
+            --filter-expression "ReadPosRankSum < -8.0" --filter-name "ReadPosRankSum" \
+            --window 35 --cluster 3 \
+            -O "${FILTERED_VCF}"
+    fi
 
-    pigz -f -p 2 "${TSV_DIR}/${SAMPLE}.tsv" 2>/dev/null || gzip -f "${TSV_DIR}/${SAMPLE}.tsv"
+    ##################################
+    # 7. Annotation (WITH DEBUGGING)
+    ##################################
+    ANNOTATED_VCF="${VCF_DIR}/${SAMPLE}.annotated.vcf.gz"
+    RSID_VCF="${VCF_DIR}/${SAMPLE}.rsID.vcf.gz"
+    GENES_VCF="${VCF_DIR}/${SAMPLE}.genes.vcf.gz"
+
+    # Check if we should skip Funcotator or use fallback
+    SKIP_FUNCOTATOR=${SKIP_FUNCOTATOR:-false}
+
+    if [ -f "${GENES_VCF}" ] && [ -s "${GENES_VCF}" ]; then
+        log "Variants already annotated: ${GENES_VCF}"
+        # Check it's not empty
+        VAR_COUNT=$(bcftools view -H "${GENES_VCF}" 2>/dev/null | wc -l)
+        if [ "${VAR_COUNT}" -eq 0 ]; then
+            log_warning "Annotated VCF exists but is EMPTY! Will re-annotate."
+            rm -f "${GENES_VCF}" "${RSID_VCF}" "${ANNOTATED_VCF}"
+        fi
+    fi
+
+    if [ ! -f "${GENES_VCF}" ] || [ ! -s "${GENES_VCF}" ]; then
+        log "Annotating variants..."
+
+        # First, check filtered VCF has variants
+        FILTERED_COUNT=$(bcftools view -H "${FILTERED_VCF}" 2>/dev/null | wc -l)
+        log "Filtered VCF has ${FILTERED_COUNT} variants to annotate"
+
+        if [ "${FILTERED_COUNT}" -eq 0 ]; then
+            log_error "Filtered VCF has no variants to annotate!"
+        fi
+
+        if [ "${SKIP_FUNCOTATOR}" = "true" ] || [ ! -d "${FUNCOTATOR_DS}" ] || [ -z "$(ls -A "${FUNCOTATOR_DS}" 2>/dev/null)" ]; then
+            log "Using SnpEff for annotation (Funcotator data not available)"
+
+            # Test SnpEff first
+            log "Testing SnpEff annotation on first 100 variants..."
+            TEST_VCF="${VCF_DIR}/${SAMPLE}.test.vcf"
+            bcftools view -H "${FILTERED_VCF}" 2>/dev/null | head -100 > "${TEST_VCF}"
+
+            # Add header
+            bcftools view -h "${FILTERED_VCF}" 2>/dev/null > "${TEST_VCF}.header"
+            cat "${TEST_VCF}.header" "${TEST_VCF}" > "${TEST_VCF}.full"
+
+            # Download and install SnpEff if needed
+            SNPEFF_DIR="${TOOLS_DIR}/snpEff"
+            SNPEFF_JAR="${SNPEFF_DIR}/snpEff.jar"
+            SNPEFF_DATA_DIR="${SNPEFF_DIR}/data"
+
+            if [ ! -f "${SNPEFF_JAR}" ]; then
+                log "Downloading SnpEff..."
+                mkdir -p "${SNPEFF_DIR}"
+                wget -q -O "${SNPEFF_JAR}" "https://snpeff.blob.core.windows.net/versions/snpEff_latest_core.zip"
+                cd "${SNPEFF_DIR}"
+                unzip -q -o snpEff_latest_core.zip 2>/dev/null || true
+            fi
+
+            # Download database if needed
+            if [ ! -d "${SNPEFF_DATA_DIR}/hg38" ]; then
+                log "Downloading SnpEff database for hg38..."
+                java -Xmx4g -jar "${SNPEFF_JAR}" download -v hg38 2>"${VCF_DIR}/${SAMPLE}.snpeff_download.log"
+            fi
+
+            # Test SnpEff on small subset
+            log "Testing SnpEff on 100 variants..."
+            java -Xmx8g -jar "${SNPEFF_JAR}" -v hg38 \
+                "${TEST_VCF}.full" \
+                -stats "${VCF_DIR}/${SAMPLE}.snpeff_test.html" \
+                > "${VCF_DIR}/${SAMPLE}.snpeff_test.vcf" 2>"${VCF_DIR}/${SAMPLE}.snpeff_test.log"
+
+            TEST_OUTPUT_COUNT=$(grep -v "^#" "${VCF_DIR}/${SAMPLE}.snpeff_test.vcf" | wc -l)
+            log "SnpEff test produced ${TEST_OUTPUT_COUNT} annotated variants"
+
+            if [ "${TEST_OUTPUT_COUNT}" -eq 0 ]; then
+                log_warning "SnpEff test produced NO output! Checking logs..."
+                tail -20 "${VCF_DIR}/${SAMPLE}.snpeff_test.log"
+                log_error "SnpEff annotation failed. Check reference genome compatibility."
+            fi
+
+            # Full annotation if test passed
+            log "Running full SnpEff annotation..."
+            java -Xmx8g -jar "${SNPEFF_JAR}" -v hg38 \
+                "${FILTERED_VCF}" \
+                -stats "${VCF_DIR}/${SAMPLE}.snpeff.html" \
+                > "${VCF_DIR}/${SAMPLE}.snpeff.vcf" 2>"${VCF_DIR}/${SAMPLE}.snpeff.log"
+
+            # Check output
+            if [ ! -s "${VCF_DIR}/${SAMPLE}.snpeff.vcf" ]; then
+                log_error "SnpEff produced empty output!"
+                log "Last 20 lines of SnpEff log:"
+                tail -20 "${VCF_DIR}/${SAMPLE}.snpeff.log"
+            fi
+
+            ANNOTATED_COUNT=$(grep -v "^#" "${VCF_DIR}/${SAMPLE}.snpeff.vcf" | wc -l)
+            log "SnpEff annotated ${ANNOTATED_COUNT} variants"
+
+            # Convert to bgzip and index
+            bgzip -c "${VCF_DIR}/${SAMPLE}.snpeff.vcf" > "${ANNOTATED_VCF}"
+            tabix -p vcf "${ANNOTATED_VCF}"
+
+            # Cleanup test files
+            rm -f "${TEST_VCF}" "${TEST_VCF}.header" "${TEST_VCF}.full" \
+                  "${VCF_DIR}/${SAMPLE}.snpeff_test.vcf" \
+                  "${VCF_DIR}/${SAMPLE}.snpeff_test.html"
+
+        else
+            # Use Funcotator if available
+            log "Annotating with Funcotator..."
+
+            # Test Funcotator first
+            log "Testing Funcotator on first 100 variants..."
+            TEST_VCF="${VCF_DIR}/${SAMPLE}.test.vcf.gz"
+            bcftools view -H "${FILTERED_VCF}" 2>/dev/null | head -100 | \
+                bgzip > "${TEST_VCF}"
+            tabix -p vcf "${TEST_VCF}"
+
+            $GATK Funcotator \
+                -R "${REF_GENOME}" \
+                -V "${TEST_VCF}" \
+                -O "${VCF_DIR}/${SAMPLE}.test_annotated.vcf.gz" \
+                --ref-version hg38 \
+                --data-sources-path "${FUNCOTATOR_DS}" \
+                --output-file-format VCF 2>"${VCF_DIR}/${SAMPLE}.funcotator_test.log"
+
+            TEST_COUNT=$(bcftools view -H "${VCF_DIR}/${SAMPLE}.test_annotated.vcf.gz" 2>/dev/null | wc -l)
+            log "Funcotator test produced ${TEST_COUNT} annotated variants"
+
+            if [ "${TEST_COUNT}" -eq 0 ]; then
+                log_warning "Funcotator test produced NO output! Checking logs..."
+                tail -20 "${VCF_DIR}/${SAMPLE}.funcotator_test.log"
+                log_warning "Falling back to SnpEff..."
+                export SKIP_FUNCOTATOR=true
+
+                # Retry with SnpEff
+                rm -f "${TEST_VCF}" "${TEST_VCF}.tbi" "${VCF_DIR}/${SAMPLE}.test_annotated.vcf.gz"
+                # This will trigger SnpEff in the next iteration
+                continue
+            fi
+
+            # Full Funcotator run
+            log "Running full Funcotator annotation..."
+            $GATK Funcotator \
+                -R "${REF_GENOME}" \
+                -V "${FILTERED_VCF}" \
+                -O "${ANNOTATED_VCF}" \
+                --ref-version hg38 \
+                --data-sources-path "${FUNCOTATOR_DS}" \
+                --output-file-format VCF 2>"${VCF_DIR}/${SAMPLE}.funcotator.log"
+
+            # Check output
+            if [ ! -s "${ANNOTATED_VCF}" ]; then
+                log_error "Funcotator produced empty output!"
+                log "Last 20 lines of Funcotator log:"
+                tail -20 "${VCF_DIR}/${SAMPLE}.funcotator.log"
+            fi
+
+            rm -f "${TEST_VCF}" "${TEST_VCF}.tbi" "${VCF_DIR}/${SAMPLE}.test_annotated.vcf.gz"
+        fi
+
+        log "Adding dbSNP IDs..."
+        bcftools annotate \
+            -a "${DBSNP}" \
+            -c ID \
+            -O z \
+            -o "${RSID_VCF}" \
+            "${ANNOTATED_VCF}" 2>"${VCF_DIR}/${SAMPLE}.rsid.log"
+
+        # Check rsID annotation worked
+        if [ ! -s "${RSID_VCF}" ]; then
+            log_warning "dbSNP annotation failed! Using original annotated VCF."
+            cp "${ANNOTATED_VCF}" "${RSID_VCF}"
+            cp "${ANNOTATED_VCF}.tbi" "${RSID_VCF}.tbi"
+        fi
+
+        log "Adding gene annotations..."
+        bcftools annotate \
+            -a "${BASE_DIR}/references/annotations/genes.bed.gz" \
+            -h "${BASE_DIR}/references/annotations/genes.bed.hdr" \
+            -c CHROM,FROM,TO,INFO/GENE \
+            -O z \
+            -o "${GENES_VCF}" \
+            "${RSID_VCF}" 2>"${VCF_DIR}/${SAMPLE}.gene_anno.log"
+
+        # Check gene annotation worked
+        if [ ! -s "${GENES_VCF}" ]; then
+            log_warning "Gene annotation failed! Using rsID VCF."
+            cp "${RSID_VCF}" "${GENES_VCF}"
+            cp "${RSID_VCF}.tbi" "${GENES_VCF}.tbi"
+        fi
+
+        # Final check
+        FINAL_COUNT=$(bcftools view -H "${GENES_VCF}" 2>/dev/null | wc -l)
+        log "Final annotated VCF has ${FINAL_COUNT} variants"
+
+        if [ "${FINAL_COUNT}" -eq 0 ]; then
+            log_error "Annotation pipeline failed - no variants in final VCF!"
+            log "Trying to create TSV directly from filtered VCF..."
+            # Fallback: create GENES_VCF from filtered VCF
+            cp "${FILTERED_VCF}" "${GENES_VCF}"
+            cp "${FILTERED_VCF}.tbi" "${GENES_VCF}.tbi"
+        fi
+    fi
+
+    ##################################
+    # 8. TSV Export
+    ##################################
+    TSV_FILE="${TSV_DIR}/${SAMPLE}.tsv"
+    TSV_GZ="${TSV_DIR}/${SAMPLE}.tsv.gz"
+
+    if [ -f "${TSV_GZ}" ]; then
+        log "TSV already exported: ${TSV_GZ}"
+    else
+        log "Exporting to TSV..."
+        echo -e "CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tGENE\tGT\tDP\tAD\tGQ" > "${TSV_FILE}"
+
+        bcftools query \
+            -f '%CHROM\t%POS\t%ID\t%REF\t%ALT\t%QUAL\t%FILTER\t%INFO/GENE[\t%GT\t%DP\t%AD\t%GQ]\n' \
+            "${GENES_VCF}" >> "${TSV_FILE}"
+
+        pigz -f -p 2 "${TSV_FILE}" 2>/dev/null || gzip -f "${TSV_FILE}"
+    fi
 
     log "Finished processing ${SAMPLE}"
     log "TSV file created: ${TSV_DIR}/${SAMPLE}.tsv.gz"
 }
 
+process_sample() {
+    local SAMPLE=$1
+    local INPUT_BAM=$2
+
+    # Skip if already processed
+    if TSV_FILE=$(check_sample_file_exists "${SAMPLE}" "tsv") && \
+       VCF_FILE=$(check_sample_file_exists "${SAMPLE}" "vcf"); then
+        log "Sample ${SAMPLE} already processed:"
+        log "  TSV: ${TSV_FILE}"
+        log "  VCF: ${VCF_FILE}"
+        log "Skipping processing..."
+        return 0
+    fi
+
+    log "Processing RNA-seq sample: ${SAMPLE}"
+
+    BAM_DIR="${BASE_DIR}/data/processed/${SAMPLE}"
+    VCF_DIR="${BASE_DIR}/data/vcf/${SAMPLE}"
+    TSV_DIR="${BASE_DIR}/data/tsv/${SAMPLE}"
+
+    mkdir -p "${BAM_DIR}" "${VCF_DIR}" "${TSV_DIR}"
+
+    if [ -z "${GATK:-}" ]; then
+        if command -v gatk &> /dev/null; then
+            GATK="gatk"
+        elif [ -f "${TOOLS_DIR}/gatk-4.6.2.0/gatk" ]; then
+            GATK="${TOOLS_DIR}/gatk-4.6.2.0/gatk"
+        else
+            log "ERROR: GATK not found. Please install GATK or set GATK environment variable"
+            return 1
+        fi
+    fi
+
+    # Check if Funcotator is available
+    if [ ! -d "${FUNCOTATOR_DS}" ] || [ -z "$(ls -A "${FUNCOTATOR_DS}" 2>/dev/null)" ]; then
+        log_warning "Funcotator data sources not found at: ${FUNCOTATOR_DS}"
+        log "Will use SnpEff for annotation instead"
+        export SKIP_FUNCOTATOR=true
+    fi
+
+    ##################################
+    # 1. Add/Replace Read Groups (Keep as is)
+    ##################################
+    RG_BAM="${BAM_DIR}/${SAMPLE}.rg.bam"
+    RG_BAI="${BAM_DIR}/${SAMPLE}.rg.bam.bai"
+
+    if [ -f "${RG_BAM}" ] && [ -f "${RG_BAI}" ]; then
+        log "Read groups already added: ${RG_BAM}"
+    else
+        log "Adding read groups..."
+        $GATK AddOrReplaceReadGroups \
+            -I "${INPUT_BAM}" \
+            -O "${RG_BAM}" \
+            -RGID "${SAMPLE}" \
+            -RGLB lib1 \
+            -RGPL ILLUMINA \
+            -RGPU "${SAMPLE}.unit1" \
+            -RGSM "${SAMPLE}" \
+            --CREATE_INDEX true
+    fi
+
+    ##################################
+    # 2. Mark Duplicates (Keep as is)
+    ##################################
+    RMDUP_BAM="${BAM_DIR}/${SAMPLE}.rmdup.bam"
+    RMDUP_BAI="${BAM_DIR}/${SAMPLE}.rmdup.bam.bai"
+
+    if [ -f "${RMDUP_BAM}" ] && [ -f "${RMDUP_BAI}" ]; then
+        log "Duplicates already marked: ${RMDUP_BAM}"
+    else
+        log "Marking duplicates..."
+        $GATK MarkDuplicates \
+            -I "${RG_BAM}" \
+            -O "${RMDUP_BAM}" \
+            -M "${BAM_DIR}/${SAMPLE}.rmdup.metrics.txt" \
+            --CREATE_INDEX true
+    fi
+
+    ##################################
+    # 3. SplitNCigarReads (RNA-SPECIFIC)
+    ##################################
+    SPLIT_BAM="${BAM_DIR}/${SAMPLE}.split.bam"
+    SPLIT_BAI="${BAM_DIR}/${SAMPLE}.split.bam.bai"
+
+    if [ -f "${SPLIT_BAM}" ] && [ -f "${SPLIT_BAI}" ]; then
+        log "N Cigar reads already split: ${SPLIT_BAM}"
+    else
+        log "Splitting N Cigar reads for RNA-seq..."
+        $GATK SplitNCigarReads \
+            -R "${REF_GENOME}" \
+            -I "${RMDUP_BAM}" \
+            -O "${SPLIT_BAM}" \
+            --create-output-bam-index true \
+            --max-mismatches-in-overhang 2  # RNA-seq specific
+    fi
+
+    ##################################
+    # 4. Base Quality Score Recalibration (OPTIONAL for RNA)
+    ##################################
+    RECAL_TABLE="${BAM_DIR}/${SAMPLE}.recal.table"
+    RECAL_BAM="${BAM_DIR}/${SAMPLE}.recal.bam"
+    RECAL_BAI="${BAM_DIR}/${SAMPLE}.recal.bam.bai"
+
+    # For RNA-seq, BQSR is often skipped or done differently
+    # Let's make it optional based on a flag
+    DO_BQSR=${DO_BQSR:-true}
+
+    if [ "${DO_BQSR}" = "true" ]; then
+        # Step 4a: Generate recalibration table
+        if [ -f "${RECAL_TABLE}" ]; then
+            log "Recalibration table already exists: ${RECAL_TABLE}"
+        else
+            log "Running BaseRecalibrator for RNA-seq..."
+            $GATK BaseRecalibrator \
+                -R "${REF_GENOME}" \
+                -I "${SPLIT_BAM}" \
+                --known-sites "${DBSNP}" \
+                --known-sites "${MILLS}" \
+                -O "${RECAL_TABLE}"
+        fi
+
+        # Step 4b: Apply BQSR
+        if [ -f "${RECAL_BAM}" ] && [ -f "${RECAL_BAI}" ]; then
+            log "BQSR already applied: ${RECAL_BAM}"
+            INPUT_FOR_VARIANTS="${RECAL_BAM}"
+        else
+            log "Applying BQSR..."
+            $GATK ApplyBQSR \
+                -R "${REF_GENOME}" \
+                -I "${SPLIT_BAM}" \
+                --bqsr-recal-file "${RECAL_TABLE}" \
+                -O "${RECAL_BAM}" \
+                --create-output-bam-index true
+            INPUT_FOR_VARIANTS="${RECAL_BAM}"
+        fi
+    else
+        log "Skipping BQSR for RNA-seq (DO_BQSR=false)"
+        INPUT_FOR_VARIANTS="${SPLIT_BAM}"
+    fi
+
+    ##################################
+    # 5. Variant Calling (RNA-SPECIFIC SETTINGS)
+    ##################################
+    RAW_VCF="${VCF_DIR}/${SAMPLE}.vcf.gz"
+
+    if [ -f "${RAW_VCF}" ]; then
+        log "Variants already called: ${RAW_VCF}"
+    else
+        log "Calling RNA-seq variants with HaplotypeCaller..."
+        $GATK HaplotypeCaller \
+            -R "${REF_GENOME}" \
+            -I "${INPUT_FOR_VARIANTS}" \
+            -O "${RAW_VCF}" \
+            --dont-use-soft-clipped-bases true \
+            --standard-min-confidence-threshold-for-calling 20.0 \
+            --min-base-quality-score 10 \
+            --annotation-group StandardAnnotation \
+            --annotation-group StandardHCAnnotation \
+            --annotation-group AS_StandardAnnotation \
+            --max-reads-per-alignment-start 50 \
+            --max-assembly-region-size 500 \
+            --pair-hmm-implementation LOGLESS_CACHING
+    fi
+
+    ##################################
+    # 6. Variant Filtration (RNA-SPECIFIC THRESHOLDS)
+    ##################################
+    FILTERED_VCF="${VCF_DIR}/${SAMPLE}.filtered.vcf.gz"
+
+    if [ -f "${FILTERED_VCF}" ]; then
+        log "Variants already filtered: ${FILTERED_VCF}"
+    else
+        log "Filtering RNA-seq variants (relaxed thresholds)..."
+        $GATK VariantFiltration \
+            -R "${REF_GENOME}" \
+            -V "${RAW_VCF}" \
+            --filter-expression "QD < 2.0" --filter-name "LowQD" \
+            --filter-expression "FS > 30.0" --filter-name "FS" \
+            --filter-expression "SOR > 3.0" --filter-name "SOR" \
+            --filter-expression "MQ < 40.0" --filter-name "LowMQ" \
+            --filter-expression "MQRankSum < -12.5" --filter-name "MQRankSum" \
+            --filter-expression "ReadPosRankSum < -8.0" --filter-name "ReadPosRankSum" \
+            --window 35 --cluster 3 \
+            -O "${FILTERED_VCF}"
+    fi
+
+    ##################################
+    # 7. Extract PASS variants only
+    ##################################
+    PASS_VCF="${VCF_DIR}/${SAMPLE}.pass.vcf.gz"
+
+    if [ -f "${PASS_VCF}" ]; then
+        log "PASS variants already extracted: ${PASS_VCF}"
+    else
+        log "Extracting PASS variants..."
+        bcftools view -f PASS "${FILTERED_VCF}" -O z -o "${PASS_VCF}"
+        tabix -p vcf "${PASS_VCF}"
+    fi
+
+    ##################################
+    # 8. Annotation (USE SnpEff for RNA-seq)
+    ##################################
+    ANNOTATED_VCF="${VCF_DIR}/${SAMPLE}.annotated.vcf.gz"
+    RSID_VCF="${VCF_DIR}/${SAMPLE}.rsID.vcf.gz"
+    GENES_VCF="${VCF_DIR}/${SAMPLE}.genes.vcf.gz"
+
+    # For RNA-seq, use SnpEff (better for transcript-aware annotation)
+    export SKIP_FUNCOTATOR=true
+
+    if [ -f "${GENES_VCF}" ] && [ -s "${GENES_VCF}" ]; then
+        log "Variants already annotated: ${GENES_VCF}"
+    else
+        log "Annotating RNA-seq variants with SnpEff..."
+
+        # First, check PASS VCF has variants
+        PASS_COUNT=$(bcftools view -H "${PASS_VCF}" 2>/dev/null | wc -l)
+        log "PASS VCF has ${PASS_COUNT} variants to annotate"
+
+        if [ "${PASS_COUNT}" -eq 0 ]; then
+            log_warning "No PASS variants found! Will annotate filtered variants instead."
+            INPUT_FOR_ANNOTATION="${FILTERED_VCF}"
+        else
+            INPUT_FOR_ANNOTATION="${PASS_VCF}"
+        fi
+
+        # Download and install SnpEff if needed
+        SNPEFF_DIR="${TOOLS_DIR}/snpEff"
+        SNPEFF_JAR="${SNPEFF_DIR}/snpEff.jar"
+        SNPEFF_DATA_DIR="${SNPEFF_DIR}/data"
+
+        if [ ! -f "${SNPEFF_JAR}" ]; then
+            log "Downloading SnpEff..."
+            mkdir -p "${SNPEFF_DIR}"
+            wget -q -O "${SNPEFF_JAR}" "https://snpeff.blob.core.windows.net/versions/snpEff_latest_core.zip"
+            cd "${SNPEFF_DIR}"
+            unzip -q -o snpEff_latest_core.zip 2>/dev/null || true
+        fi
+
+        # Download database if needed
+        if [ ! -d "${SNPEFF_DATA_DIR}/hg38" ]; then
+            log "Downloading SnpEff database for hg38..."
+            java -Xmx4g -jar "${SNPEFF_JAR}" download -v hg38 2>"${VCF_DIR}/${SAMPLE}.snpeff_download.log"
+        fi
+
+        # Annotate with SnpEff
+        log "Running SnpEff annotation..."
+        java -Xmx8g -jar "${SNPEFF_JAR}" -v hg38 \
+            -cancer \
+            -canon \
+            -noLog \
+            "${INPUT_FOR_ANNOTATION}" \
+            -stats "${VCF_DIR}/${SAMPLE}.snpeff.html" \
+            > "${VCF_DIR}/${SAMPLE}.snpeff.vcf" 2>"${VCF_DIR}/${SAMPLE}.snpeff.log"
+
+        # Check output
+        if [ ! -s "${VCF_DIR}/${SAMPLE}.snpeff.vcf" ]; then
+            log_error "SnpEff produced empty output!"
+            log "Last 20 lines of SnpEff log:"
+            tail -20 "${VCF_DIR}/${SAMPLE}.snpeff.log"
+        fi
+
+        ANNOTATED_COUNT=$(grep -v "^#" "${VCF_DIR}/${SAMPLE}.snpeff.vcf" | wc -l)
+        log "SnpEff annotated ${ANNOTATED_COUNT} variants"
+
+        # Convert to bgzip and index
+        bgzip -c "${VCF_DIR}/${SAMPLE}.snpeff.vcf" > "${ANNOTATED_VCF}"
+        tabix -p vcf "${ANNOTATED_VCF}"
+
+        log "Adding dbSNP IDs..."
+        bcftools annotate \
+            -a "${DBSNP}" \
+            -c ID \
+            -O z \
+            -o "${RSID_VCF}" \
+            "${ANNOTATED_VCF}" 2>"${VCF_DIR}/${SAMPLE}.rsid.log"
+
+        # Check rsID annotation worked
+        if [ ! -s "${RSID_VCF}" ]; then
+            log_warning "dbSNP annotation failed! Using original annotated VCF."
+            cp "${ANNOTATED_VCF}" "${RSID_VCF}"
+            cp "${ANNOTATED_VCF}.tbi" "${RSID_VCF}.tbi"
+        fi
+
+        log "Adding gene annotations..."
+        bcftools annotate \
+            -a "${BASE_DIR}/references/annotations/genes.bed.gz" \
+            -h "${BASE_DIR}/references/annotations/genes.bed.hdr" \
+            -c CHROM,FROM,TO,INFO/GENE \
+            -O z \
+            -o "${GENES_VCF}" \
+            "${RSID_VCF}" 2>"${VCF_DIR}/${SAMPLE}.gene_anno.log"
+
+        # Check gene annotation worked
+        if [ ! -s "${GENES_VCF}" ]; then
+            log_warning "Gene annotation failed! Using rsID VCF."
+            cp "${RSID_VCF}" "${GENES_VCF}"
+            cp "${RSID_VCF}.tbi" "${GENES_VCF}.tbi"
+        fi
+
+        # Final check
+        FINAL_COUNT=$(bcftools view -H "${GENES_VCF}" 2>/dev/null | wc -l)
+        log "Final annotated VCF has ${FINAL_COUNT} variants"
+    fi
+
+    ##################################
+    # 9. TSV Export (RNA-seq optimized)
+    ##################################
+    TSV_FILE="${TSV_DIR}/${SAMPLE}.tsv"
+    TSV_GZ="${TSV_DIR}/${SAMPLE}.tsv.gz"
+
+    if [ -f "${TSV_GZ}" ]; then
+        log "TSV already exported: ${TSV_GZ}"
+    else
+        log "Exporting RNA-seq variants to TSV..."
+
+        # Use genes.vcf.gz or fallback to annotated.vcf.gz
+        if [ -f "${GENES_VCF}" ] && [ -s "${GENES_VCF}" ]; then
+            INPUT_VCF="${GENES_VCF}"
+        elif [ -f "${ANNOTATED_VCF}" ] && [ -s "${ANNOTATED_VCF}" ]; then
+            INPUT_VCF="${ANNOTATED_VCF}"
+        else
+            INPUT_VCF="${PASS_VCF}"
+            log_warning "Using PASS VCF for TSV export (annotation files missing)"
+        fi
+
+        # Check variant count
+        VAR_COUNT=$(bcftools view -H "${INPUT_VCF}" 2>/dev/null | wc -l)
+        log "Exporting ${VAR_COUNT} RNA-seq variants to TSV"
+
+        if [ "${VAR_COUNT}" -eq 0 ]; then
+            log_warning "No variants to export! Creating empty TSV."
+            echo -e "CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tGENE\tANNOTATION\tIMPACT\tGT\tDP\tAD\tGQ" > "${TSV_FILE}"
+        else
+            # Try to extract SnpEff annotations
+            echo -e "CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tGENE\tANNOTATION\tIMPACT\tGT\tDP\tAD\tGQ" > "${TSV_FILE}"
+
+            # Try to get SnpEff ANN field
+            bcftools query \
+                -f '%CHROM\t%POS\t%ID\t%REF\t%ALT\t%QUAL\t%FILTER\t%INFO/ANN\n' \
+                "${INPUT_VCF}" 2>/dev/null | \
+            awk -F'\t' '{
+                # Parse ANN field (Format: Allele|Annotation|Impact|GeneName...)
+                split($8, ann, "|");
+                gene = ann[4];
+                annotation = ann[2];
+                impact = ann[3];
+                print $1 "\t" $2 "\t" $3 "\t" $4 "\t" $5 "\t" $6 "\t" $7 "\t" gene "\t" annotation "\t" impact;
+            }' >> "${TSV_FILE}"
+
+            # If no ANN field, try simpler format
+            if [ $(wc -l < "${TSV_FILE}") -le 1 ]; then
+                log "No ANN field found, using simple format..."
+                echo -e "CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tGENE\tGT\tDP\tAD\tGQ" > "${TSV_FILE}"
+                bcftools query \
+                    -f '%CHROM\t%POS\t%ID\t%REF\t%ALT\t%QUAL\t%FILTER\t%INFO/GENE[\t%GT\t%DP\t%AD\t%GQ]\n' \
+                    "${INPUT_VCF}" >> "${TSV_FILE}" 2>/dev/null
+            fi
+        fi
+
+        # Check result
+        TSV_LINES=$(wc -l < "${TSV_FILE}")
+        log "TSV exported with ${TSV_LINES} lines"
+
+        if [ "${TSV_LINES}" -gt 1 ]; then
+            log "Success! Compressing TSV..."
+            pigz -f -p 2 "${TSV_FILE}" 2>/dev/null || gzip -f "${TSV_FILE}"
+        else
+            log_warning "TSV export failed - keeping empty file for debugging"
+            pigz -f -p 2 "${TSV_FILE}" 2>/dev/null || gzip -f "${TSV_FILE}"
+        fi
+    fi
+
+    log "Finished processing RNA-seq sample ${SAMPLE}"
+    log "TSV file created: ${TSV_DIR}/${SAMPLE}.tsv.gz"
+}
 
 ############################################################
 # Main Pipeline Functions
@@ -2236,6 +3257,9 @@ COMMAND="$1"
 shift
 
 case "${COMMAND}" in
+    "status")
+        show_pipeline_status_simple
+        ;;
     "install")
         install_all_tools
         ;;
