@@ -1,5 +1,4 @@
-```
-mermaid
+```mermaid
 flowchart TD
     A[Start Pipeline] --> B[Setup Environment<br/>& Configuration]
     B --> C{Load SRA IDs<br/>from Excel File}
