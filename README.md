@@ -1,99 +1,72 @@
 ```
 mermaid
 flowchart TD
-    Start([Start Pipeline]) --> Config[Configuration & Setup]
+    A[Start Pipeline] --> B[Setup Environment<br/>& Configuration]
+    B --> C{Load SRA IDs<br/>from Excel File}
+    C --> D[Extract SRA IDs<br/>with Python Script]
+    D --> E{Process Samples<br/>Sequentially}
     
-    Config --> ExcelCheck{Excel File Provided?}
-    ExcelCheck -- Yes --> ExtractSRA[Extract SRA IDs from Excel]
-    ExcelCheck -- No --> ManualSRA[Manual SRA List Input]
+    E --> F[Download SRA File]
+    F --> G[Validate SRA File]
+    G --> H[Extract FASTQ Files]
+    H --> I[Quality Control<br/>FastQC on Raw Reads]
+    I --> J[Trim Adapters<br/>Trimmomatic]
+    J --> K[Quality Control<br/>FastQC on Trimmed Reads]
+    K --> L[Align with STAR<br/>RNA-seq Alignment]
+    L --> M{Check RNA or DNA?}
     
-    ExtractSRA --> LoadIDs[Load SRA IDs]
-    ManualSRA --> LoadIDs
+    M -->|RNA-seq| N[RNA-seq Processing<br/>Add Read Groups, Mark Duplicates]
+    N --> O[Split N Cigar Reads]
+    O --> P{BQSR?}
+    P -->|No| Q[Skip BQSR for RNA-seq]
+    P -->|Yes| R[Run Base Quality Recalibration]
+    R --> Q
     
-    LoadIDs --> ToolCheck{Tools Installed?}
-    ToolCheck -- No --> InstallTools[Install All Tools]
-    ToolCheck -- Yes --> RefCheck{References Downloaded?}
+    M -->|DNA-seq| S[DNA-seq Processing<br/>Add Read Groups, Mark Duplicates]
+    S --> T[DNA-seq BQSR]
+    T --> U
     
-    InstallTools --> RefCheck
+    Q --> V{Variant Calling}
+    V -->|RNA-seq| W[Mutect2 with Coverage Intervals<br/>Fast & Accurate]
+    V -->|DNA-seq| X[HaplotypeCaller with GVCF<br/>Industry Standard]
     
-    RefCheck -- No --> DownloadRefs[Download Reference Files]
-    RefCheck -- Yes --> ProcessLoop[Process Each Sample]
+    W --> Y[Filter Variants<br/>VariantFiltration]
+    X --> Y
     
-    DownloadRefs --> ProcessLoop
+    Y --> Z{Annotation Method}
+    Z -->|Funcotator Available| AA[Funcotator Annotation<br/>Comprehensive]
+    Z -->|No Funcotator| AB[SnpEff Annotation<br/>Transcript-aware]
+    Z -->|Fallback| AC[bcftools csq<br/>Simple Annotation]
     
-    ProcessLoop --> SampleCheck{Check Sample Status}
+    AA --> AD[Add dbSNP IDs]
+    AB --> AD
+    AC --> AD
     
-    SampleCheck -- Completed --> SkipSample[Skipped]
-    SampleCheck -- Partial --> ResumeStep[Resume from Last Step]
-    SampleCheck -- Not Started --> StartSample[Start Processing]
+    AD --> AE[Add Gene Annotations<br/>from BED file]
+    AE --> AF[Export to TSV Format]
+    AF --> AG[Compress & Index Files]
     
-    SkipSample --> NextSample{More Samples?}
-    ResumeStep --> ContinueSteps[Continue from Last Step]
+    AG --> AH{Clean Intermediate Files?}
+    AH -->|Yes| AI[Remove SRA, FASTQ,<br/>Temporary BAMs]
+    AH -->|No| AJ[Keep All Files<br/>for Debugging]
     
-    StartSample --> Step1[1. Download SRA File]
-    Step1 --> ValidateSRA[Validate SRA File]
-    ValidateSRA --> Step2[2. Extract FASTQ Files]
-    Step2 --> Step3[3. Run FastQC (Raw)]
-    Step3 --> Step4[4. Trim Adapters]
-    Step4 --> Step5[5. Run FastQC (Trimmed)]
-    Step5 --> Step6[6. Align with STAR]
-    Step6 --> Step7[7. Variant Calling]
+    AI --> AK[Next Sample]
+    AJ --> AK
     
-    ContinueSteps --> Step7
+    AK --> E
     
-    subgraph VariantCalling [Variant Calling Strategy]
-        DataTypeCheck{RNA-seq or DNA-seq?}
-        
-        DataTypeCheck -- RNA-seq --> RNAStrategy[RNA-seq: Mutect2]
-        RNAStrategy --> CreateIntervals[Create Coverage Intervals<br>≥10x coverage]
-        CreateIntervals --> RNAMutect2[Run Mutect2]
-        
-        DataTypeCheck -- DNA-seq --> DNAStrategy[DNA-seq: HaplotypeCaller]
-        DNAStrategy --> HaplotypeCaller[Run HaplotypeCaller with GVCF]
-    end
-    
-    Step7 --> VariantCalling
-    RNAMutect2 --> Step8[8. Variant Filtration]
-    HaplotypeCaller --> Step8
-    
-    Step8 --> Step9[9. Extract PASS Variants]
-    Step9 --> Step10[10. Annotation]
-    
-    subgraph Annotation [Annotation Strategy]
-        FuncotatorCheck{Funcotator Available?}
-        
-        FuncotatorCheck -- Yes --> UseFuncotator[Use Funcotator]
-        FuncotatorCheck -- No --> SnpEffCheck{SnpEff Available?}
-        
-        SnpEffCheck -- Yes --> UseSnpEff[Use SnpEff]
-        SnpEffCheck -- No --> BCFToolsAnno[Use bcftools csq]
-        
-        BCFToolsAnno --> SimpleAnno[Simple Gene Annotation]
-    end
-    
-    Step10 --> Annotation
-    UseFuncotator --> Step11[11. Add dbSNP IDs]
-    UseSnpEff --> Step11
-    SimpleAnno --> Step11
-    
-    Step11 --> Step12[12. Add Gene Annotations]
-    Step12 --> Step13[13. Export to TSV]
-    Step13 --> Cleanup{Keep Intermediate Files?}
-    
-    Cleanup -- No --> RemoveIntermed[Remove Intermediate Files]
-    Cleanup -- Yes --> KeepFiles[Keep All Files]
-    
-    RemoveIntermed --> NextSample
-    KeepFiles --> NextSample
-    
-    NextSample -- Yes --> ProcessLoop
-    NextSample -- No --> MergeTSV[Merge All TSV Files]
-    
-    MergeTSV --> QCReport[Generate QC Reports]
-    QCReport --> FinalOutput[Final Output: all_samples.tsv.gz]
-    FinalOutput --> End([Pipeline Complete])
+    E -->|All Samples Processed| AL[Merge All TSV Files<br/>into Single Dataset]
+    AL --> AM[Generate Summary Report<br/>MultiQC]
+    AM --> AN[End Pipeline<br/>Output Ready]
     
     %% Styling
     classDef process fill:#e1f5fe,stroke:#01579b,stroke-width:2px
-    classDef decision fill:#f3e5f5
+    classDef decision fill:#f3e5f5,stroke:#4a148c,stroke-width:2px
+    classDef inputoutput fill:#e8f5e8,stroke:#2e7d32,stroke-width:2px
+    classDef annotation fill:#fff3e0,stroke:#ef6c00,stroke-width:2px
+    
+    class A,B,F,G,H,I,J,K,L,M,N,O,P,Q,R,S,T,U,V,W,X,Y,Z,AA,AB,AC,AD,AE,AF,AG,AH,AI,AJ,AK process
+    class C,E,P,M,Z,AH decision
+    class D,AL,AM,AN inputoutput
+    class AA,AB,AC annotation
 ```
