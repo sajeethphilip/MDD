@@ -1,71 +1,256 @@
+# Overall Pipeline Architecture
+
 ```mermaid
-flowchart TD
-    A[Start Pipeline] --> B[Setup Environment<br/>& Configuration]
-    B --> C{Load SRA IDs<br/>from Excel File}
-    C --> D[Extract SRA IDs<br/>with Python Script]
-    D --> E{Process Samples<br/>Sequentially}
+graph TD
+    Start[Start: MDD2 Pipeline] --> Config{Configuration Check}
     
-    E --> F[Download SRA File]
-    F --> G[Validate SRA File]
-    G --> H[Extract FASTQ Files]
-    H --> I[Quality Control<br/>FastQC on Raw Reads]
-    I --> J[Trim Adapters<br/>Trimmomatic]
-    J --> K[Quality Control<br/>FastQC on Trimmed Reads]
-    K --> L[Align with STAR<br/>RNA-seq Alignment]
-    L --> M{Check RNA or DNA?}
+    Config --> Excel{Excel File Provided?}
+    Excel -->|Yes| ExtractSRA[Extract SRA IDs from Excel]
+    Excel -->|No| Prompt[Prompt for Excel File]
+    Prompt --> ExtractSRA
     
-    M -->|RNA-seq| N[RNA-seq Processing<br/>Add Read Groups, Mark Duplicates]
-    N --> O[Split N Cigar Reads]
-    O --> P{BQSR?}
-    P -->|No| Q[Skip BQSR for RNA-seq]
-    P -->|Yes| R[Run Base Quality Recalibration]
-    R --> Q
+    ExtractSRA --> SRA_List[List of SRA IDs]
     
-    M -->|DNA-seq| S[DNA-seq Processing<br/>Add Read Groups, Mark Duplicates]
-    S --> T[DNA-seq BQSR]
-    T --> U
+    SRA_List --> Command{Command Selection}
     
-    Q --> V{Variant Calling}
-    V -->|RNA-seq| W[Mutect2 with Coverage Intervals<br/>Fast & Accurate]
-    V -->|DNA-seq| X[HaplotypeCaller with GVCF<br/>Industry Standard]
+    Command -->|install| InstallFlow[Tool Installation Flow]
+    Command -->|setup| SetupFlow[Reference Setup Flow]
+    Command -->|run| MainFlow[Main Analysis Flow]
+    Command -->|fastq| FastqFlow[FASTQ Processing Flow]
+    Command -->|align| AlignFlow[Alignment Flow]
+    Command -->|process-all| ProcessFlow[Variant Calling Flow]
     
-    W --> Y[Filter Variants<br/>VariantFiltration]
-    X --> Y
+    InstallFlow --> End1[End: Tools Installed]
+    SetupFlow --> End2[End: References Ready]
+    MainFlow --> Final[End: Analysis Complete]
+    FastqFlow --> End3[End: FASTQ Processed]
+    AlignFlow --> End4[End: Alignment Complete]
+    ProcessFlow --> End5[End: Variants Called]
+```
+# Tool Installation Flow
+```mermaid
+graph TD
+    StartInstall[Start: install] --> SetupEnv[Setup Environment]
     
-    Y --> Z{Annotation Method}
-    Z -->|Funcotator Available| AA[Funcotator Annotation<br/>Comprehensive]
-    Z -->|No Funcotator| AB[SnpEff Annotation<br/>Transcript-aware]
-    Z -->|Fallback| AC[bcftools csq<br/>Simple Annotation]
+    SetupEnv --> Java[Install Java]
+    Java --> SRA[Install SRA Toolkit]
+    SRA --> FastQC[Install FastQC]
+    FastQC --> MultiQC[Install MultiQC]
+    MultiQC --> Trimmomatic[Install Trimmomatic]
+    Trimmomatic --> GATK[Install GATK]
+    GATK --> BioTools[Install Bioinformatics Tools<br/>samtools/bcftools]
+    BioTools --> Parallel[Install Parallel Tools<br/>pigz/parallel]
+    Parallel --> STAR[Install STAR Aligner]
     
-    AA --> AD[Add dbSNP IDs]
-    AB --> AD
-    AC --> AD
+    STAR --> Verify[Verify All Installations]
+    Verify --> CreateEnv[Create Environment Script]
+    CreateEnv --> EndInstall[End: Tools Ready]
+```
+#  Main Analysis Flow (Sequential Processing)
+
+```mermaid
+graph TD
+    StartRun[Start: run command] --> ForEach[For Each SRA ID]
     
-    AD --> AE[Add Gene Annotations<br/>from BED file]
-    AE --> AF[Export to TSV Format]
-    AF --> AG[Compress & Index Files]
+    ForEach --> CheckStatus{Check Sample Status}
     
-    AG --> AH{Clean Intermediate Files?}
-    AH -->|Yes| AI[Remove SRA, FASTQ,<br/>Temporary BAMs]
-    AH -->|No| AJ[Keep All Files<br/>for Debugging]
+    CheckStatus -->|not_started| Download[Download SRA]
+    CheckStatus -->|downloaded| Extract[Extract FASTQ]
+    CheckStatus -->|extracted| Trim[Trim Reads]
+    CheckStatus -->|trimmed| Align[Align with STAR]
+    CheckStatus -->|aligned| Process[Process Variants]
+    CheckStatus -->|completed| Skip[Skip - Already Done]
     
-    AI --> AK[Next Sample]
-    AJ --> AK
+    Download --> QC1[FastQC: Raw Reads]
+    Extract --> QC1
+    QC1 --> Trim
+    Trim --> QC2[FastQC: Trimmed Reads]
+    QC2 --> Align
+    Align --> Process
+    Process --> NextSample{More Samples?}
     
-    AK --> E
+    NextSample -->|Yes| ForEach
+    NextSample -->|No| Merge[Merge All TSV Files]
+    Merge --> FinalOutput[Final: all_samples.tsv.gz]
+    FinalOutput --> EndRun[End: Pipeline Complete]
+```
+
+# Single Sample Processing Pipeline
+
+```mermaid
+graph TD
+    StartSample[Sample: SRRXXXXXX] --> DownloadSRA[Download SRA File]
+    DownloadSRA --> ValidateSRA[Validate SRA]
+    ValidateSRA --> ExtractFASTQ[Extract Paired FASTQ]
+    ExtractFASTQ --> RawQC[FastQC on Raw Reads]
     
-    E -->|All Samples Processed| AL[Merge All TSV Files<br/>into Single Dataset]
-    AL --> AM[Generate Summary Report<br/>MultiQC]
-    AM --> AN[End Pipeline<br/>Output Ready]
+    RawQC --> TrimAdapters[Trim with Trimmomatic]
+    TrimAdapters --> TrimmedQC[FastQC on Trimmed Reads]
     
-    %% Styling
-    classDef process fill:#e1f5fe,stroke:#01579b,stroke-width:2px
-    classDef decision fill:#f3e5f5,stroke:#4a148c,stroke-width:2px
-    classDef inputoutput fill:#e8f5e8,stroke:#2e7d32,stroke-width:2px
-    classDef annotation fill:#fff3e0,stroke:#ef6c00,stroke-width:2px
+    TrimmedQC --> CheckSTAR{STAR Index Exists?}
+    CheckSTAR -->|No| BuildIndex[Build STAR Index]
+    CheckSTAR -->|Yes| AlignSTAR[Align with STAR]
+    BuildIndex --> AlignSTAR
     
-    class A,B,F,G,H,I,J,K,L,M,N,O,P,Q,R,S,T,U,V,W,X,Y,Z,AA,AB,AC,AD,AE,AF,AG,AH,AI,AJ,AK process
-    class C,E,P,M,Z,AH decision
-    class D,AL,AM,AN inputoutput
-    class AA,AB,AC annotation
+    AlignSTAR --> IndexBAM[Index BAM File]
+    
+    IndexBAM --> ProcessDNA{RNA or DNA?}
+    
+    ProcessDNA -->|DNA| DNA_Flow[DNA Processing Flow]
+    ProcessDNA -->|RNA| RNA_Flow[RNA Processing Flow]
+    
+    DNA_Flow --> TSV_DNA[Export DNA Variants to TSV]
+    RNA_Flow --> TSV_RNA[Export RNA Variants to TSV]
+    
+    TSV_DNA --> Cleanup{Keep Intermediate?}
+    TSV_RNA --> Cleanup
+    
+    Cleanup -->|Yes| Keep[Keep All Files]
+    Cleanup -->|No| Remove[Remove Intermediate Files]
+    
+    Keep --> EndSample[End: Sample Complete]
+    Remove --> EndSample
+```
+# DNA-seq Variant Calling Flow
+
+```mermaid
+graph TD
+    StartDNA[Input: Aligned BAM] --> AddRG[Add/Replace Read Groups]
+    
+    AddRG --> MarkDup[Mark Duplicates]
+    MarkDup --> SplitNCigar[Split N Cigar Reads]
+    SplitNCigar --> BQSR1[BaseRecalibrator<br/>Create Recal Table]
+    BQSR1 --> ApplyBQSR[Apply BQSR]
+    
+    ApplyBQSR --> CallVariants[HaplotypeCaller<br/>ERC GVCF Mode]
+    CallVariants --> Filter[Variant Filtration]
+    
+    Filter --> Annotate{Annotation Method}
+    
+    Annotate -->|Funcotator| Func[Funcotator Annotation]
+    Annotate -->|SnpEff| SnpEff[SnpEff Annotation]
+    Annotate -->|Fallback| Simple[Simple Annotation]
+    
+    Func --> AddRSID[Add dbSNP IDs]
+    SnpEff --> AddRSID
+    Simple --> AddRSID
+    
+    AddRSID --> AddGenes[Add Gene Annotations]
+    AddGenes --> Export[Export to TSV]
+    Export --> EndDNA[End: DNA Variants]
+```
+# RNA-seq Variant Calling Flow (Evidence-Based)
+``` mermaid
+graph TD
+    StartRNA[Input: RNA-seq BAM] --> AddRG_RNA[Add Read Groups]
+    
+    AddRG_RNA --> MarkDup_RNA[Mark Duplicates]
+    MarkDup_RNA --> SplitNCigar_RNA[Split N Cigar Reads<br/>RNA-specific]
+    
+    SplitNCigar_RNA --> BQSR_Opt{BQSR for RNA?}
+    
+    BQSR_Opt -->|Yes| BQSR_RNA[Base Quality Recalibration]
+    BQSR_Opt -->|No| SkipBQSR[Skip BQSR]
+    
+    BQSR_RNA --> CallVariants_RNA
+    SkipBQSR --> CallVariants_RNA
+    
+    CallVariants_RNA --> Method{RNA Variant Calling Method}
+    
+    Method -->|Evidence-Based| CoverageBed[Create Coverage BED<br/>(≥10x coverage)]
+    CoverageBed --> Mutect2[Mutect2 on Covered Regions]
+    
+    Method -->|Traditional| HaplotypeCaller_RNA[HaplotypeCaller<br/>RNA settings]
+    
+    Mutect2 --> Filter_RNA[Filter RNA Variants]
+    HaplotypeCaller_RNA --> Filter_RNA
+    
+    Filter_RNA --> ExtractPASS[Extract PASS Variants]
+    ExtractPASS --> AnnotateRNA[SnpEff Annotation<br/>(RNA-aware)]
+    
+    AnnotateRNA --> AddRSID_RNA[Add dbSNP IDs]
+    AddRSID_RNA --> AddGenes_RNA[Add Gene Info]
+    AddGenes_RNA --> ExportRNA[Export RNA Variants to TSV]
+    
+    ExportRNA --> EndRNA[End: RNA Variants]
+```
+
+# Quality Control & Reporting Flow
+
+```mermaid
+graph TD
+    StartQC[QC Pipeline] --> RawFastQC[FastQC: Raw FASTQ]
+    RawFastQC --> TrimQC[Trimmomatic QC]
+    TrimQC --> TrimmedFastQC[FastQC: Trimmed FASTQ]
+    
+    TrimmedFastQC --> AlignmentQC[Alignment Metrics]
+    AlignmentQC --> DuplicateQC[Duplicate Metrics]
+    
+    DuplicateQC --> VariantQC[Variant Calling Metrics]
+    VariantQC --> AnnotationQC[Annotation Statistics]
+    
+    AnnotationQC --> MultiQC_Report[MultiQC Report Generation]
+    MultiQC_Report --> FinalReport[Final QC Report]
+    
+    FinalReport --> EndQC[End: QC Complete]
+```
+#  Error Handling & Resume Flow
+```mermaid
+graph TD
+    StartResume[Resume Pipeline] --> ForEachSample[For Each Sample]
+    
+    ForEachSample --> CheckFiles{Check Output Files}
+    
+    CheckFiles --> SRA_Exists{SRA exists?}
+    SRA_Exists -->|Yes| SkipDownload
+    SRA_Exists -->|No| DownloadNeeded
+    
+    CheckFiles --> FASTQ_Exists{FASTQ exists?}
+    FASTQ_Exists -->|Yes| SkipExtract
+    FASTQ_Exists -->|No| ExtractNeeded
+    
+    CheckFiles --> BAM_Exists{BAM exists?}
+    BAM_Exists -->|Yes| SkipAlign
+    BAM_Exists -->|No| AlignNeeded
+    
+    CheckFiles --> VCF_Exists{VCF/TSV exists?}
+    VCF_Exists -->|Yes| SkipProcess
+    VCF_Exists -->|No| ProcessNeeded
+    
+    SkipDownload --> FASTQ_Exists
+    DownloadNeeded --> ExtractNeeded
+    SkipExtract --> BAM_Exists
+    ExtractNeeded --> AlignNeeded
+    SkipAlign --> VCF_Exists
+    AlignNeeded --> ProcessNeeded
+    SkipProcess --> NextResume{More Samples?}
+    ProcessNeeded --> NextResume
+    
+    NextResume -->|Yes| ForEachSample
+    NextResume -->|No| EndResume[End: Resume Complete]
+```
+# Configuration & Environment Flow
+```mermaid
+graph TD
+    StartConfig[Configuration] --> BaseDirs[Setup Base Directories]
+    BaseDirs --> ToolPaths[Set Tool Paths]
+    ToolPaths --> RefPaths[Set Reference Paths]
+    
+    RefPaths --> CheckRefs{References Downloaded?}
+    CheckRefs -->|No| DownloadRefs[Download References]
+    CheckRefs -->|Yes| SkipRefs[Skip Download]
+    
+    DownloadRefs --> IndexRefs[Index References]
+    SkipRefs --> IndexRefs
+    
+    IndexRefs --> CreateGeneBed[Create Gene BED File]
+    CreateGeneBed --> FuncotatorDS{Funcotator Data Sources?}
+    
+    FuncotatorDS -->|No| DownloadFunc[Download Funcotator DB]
+    FuncotatorDS -->|Yes| SkipFunc[Skip Download]
+    
+    DownloadFunc --> CreateEnv[Create Environment Script]
+    SkipFunc --> CreateEnv
+    
+    CreateEnv --> EndConfig[End: Configuration Ready]
 ```
