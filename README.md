@@ -157,7 +157,7 @@ graph TD
     
     CallVariants_RNA --> Method{RNA Variant Calling Method}
     
-    Method -->|Evidence-Based| CoverageBed[Create Coverage BED<br/>(≥10x coverage)]
+    Method -->|Evidence-Based| CoverageBed[Create Coverage BED<br/>=10x coverage]
     CoverageBed --> Mutect2[Mutect2 on Covered Regions]
     
     Method -->|Traditional| HaplotypeCaller_RNA[HaplotypeCaller<br/>RNA settings]
@@ -166,7 +166,7 @@ graph TD
     HaplotypeCaller_RNA --> Filter_RNA
     
     Filter_RNA --> ExtractPASS[Extract PASS Variants]
-    ExtractPASS --> AnnotateRNA[SnpEff Annotation<br/>(RNA-aware)]
+    ExtractPASS --> AnnotateRNA[SnpEff Annotation<br/>RNA-aware]
     
     AnnotateRNA --> AddRSID_RNA[Add dbSNP IDs]
     AddRSID_RNA --> AddGenes_RNA[Add Gene Info]
