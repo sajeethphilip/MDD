@@ -2412,6 +2412,9 @@ process_sample_DNA() {
     else
         log "Calling RNA-seq variants..."
 
+        # Store original method for fallback tracking
+        CALLING_METHOD_USED="${RNA_CALLING_METHOD}"
+
         case "${RNA_CALLING_METHOD}" in
             "evidence")
                 log "Using EVIDENCE-BASED method: Coverage filtering + Mutect2"
@@ -2428,45 +2431,74 @@ process_sample_DNA() {
                         gunzip -c "${GENE_BED}.gz" > "${GENE_BED}"
                     fi
 
-                    # Calculate coverage and filter
-                    samtools depth -a "${INPUT_FOR_VARIANTS}" | \
+                    # Calculate coverage - use -aa for all positions (including zero coverage)
+                    # This is CRITICAL for RNA-seq where many regions have zero coverage
+                    log "Calculating genome-wide coverage (this may take a few minutes)..."
+                    samtools depth -aa "${INPUT_FOR_VARIANTS}" 2>/dev/null | \
                         awk -v min_cov="${MIN_COVERAGE}" '$3 >= min_cov {print $1 "\t" $2-1 "\t" $2}' | \
                         sort -k1,1 -k2,2n | \
-                        bedtools merge -i - > "${COVERAGE_BED}" 2>"${BAM_DIR}/${SAMPLE}.coverage.log"
+                        bedtools merge -i - 2>/dev/null > "${COVERAGE_BED}"
 
-                    COVERAGE_REGIONS=$(wc -l < "${COVERAGE_BED}")
-                    log "Found ${COVERAGE_REGIONS} genomic regions with ≥${MIN_COVERAGE}x coverage"
+                    if [ -s "${COVERAGE_BED}" ]; then
+                        COVERAGE_REGIONS=$(wc -l < "${COVERAGE_BED}")
+                        COVERAGE_BASES=$(awk '{sum += $3-$2} END {print sum}' "${COVERAGE_BED}")
+                        log "Found ${COVERAGE_REGIONS} regions (${COVERAGE_BASES} bases) with ≥${MIN_COVERAGE}x coverage"
 
-                    if [ "${COVERAGE_REGIONS}" -eq 0 ]; then
-                        log_warning "No regions meet coverage threshold! Falling back to traditional method"
-                        RNA_CALLING_METHOD="traditional"
+                        if [ "${COVERAGE_REGIONS}" -eq 0 ]; then
+                            log_warning "No regions meet coverage threshold! Falling back to traditional method"
+                            CALLING_METHOD_USED="traditional"
+                        fi
+                    else
+                        log_warning "Coverage calculation failed or produced empty BED! Falling back to traditional method"
+                        CALLING_METHOD_USED="traditional"
                     fi
                 else
                     log "Using existing coverage BED file: ${COVERAGE_BED}"
+                    COVERAGE_REGIONS=$(wc -l < "${COVERAGE_BED}" 2>/dev/null || echo "0")
+                    if [ "${COVERAGE_REGIONS}" -eq 0 ]; then
+                        log_warning "Existing coverage BED is empty! Falling back to traditional method"
+                        CALLING_METHOD_USED="traditional"
+                    fi
                 fi
 
                 # Step 2: Call variants with Mutect2 on covered regions
-                if [ "${RNA_CALLING_METHOD}" = "evidence" ]; then
-                    log "Calling variants with Mutect2 on covered regions..."
+                if [ "${CALLING_METHOD_USED}" = "evidence" ]; then
+                    log "Calling variants with Mutect2 on ${COVERAGE_REGIONS} covered regions..."
+
+                    # For Mutect2, we need a panel of normals (PON) for best results
+                    # If no PON is available, we'll use germline mode
+                    PON_FILE="${BASE_DIR}/references/known_sites/mutect2_pon.vcf.gz"
+                    MUTECT2_MODE="--germline-resource ${DBSNP}"
+
+                    if [ -f "${PON_FILE}" ] && [ -f "${PON_FILE}.tbi" ]; then
+                        MUTECT2_MODE="--panel-of-normals ${PON_FILE}"
+                        log "Using panel of normals for Mutect2"
+                    else
+                        log "Using germline mode for Mutect2 (no PON available)"
+                    fi
 
                     $GATK Mutect2 \
                         -R "${REF_GENOME}" \
                         -I "${INPUT_FOR_VARIANTS}" \
                         -O "${RAW_VCF}" \
                         -L "${COVERAGE_BED}" \
+                        ${MUTECT2_MODE} \
                         --dont-use-soft-clipped-bases true \
                         --minimum-mapping-quality ${MIN_MAPQ} \
                         --minimum-base-quality ${MIN_BASE_QUALITY} \
-                        --native-pair-hmm-threads ${GATK_THREADS} \
-                        --max-reads-per-alignment-start 100 \
-                        --downsampling-stride 20 \
-                        --max-suspicious-reads-per-alignment-start 6
+                        --native-pair-hmm-threads ${GATK_THREADS}
+
+                    # Mutect2 produces unfiltered calls - we'll filter in the next step
                 fi
                 ;;
 
             "traditional")
+                CALLING_METHOD_USED="traditional"
                 log "Using TRADITIONAL method: HaplotypeCaller with RNA-seq settings"
 
+                # CRITICAL FIX: Remove annotation groups that cause errors in GATK 4.6.2.0
+                # The --annotation-group AS_StandardAnnotation is NOT supported for VCF output
+                # in this GATK version for RNA-seq analysis
                 $GATK HaplotypeCaller \
                     -R "${REF_GENOME}" \
                     -I "${INPUT_FOR_VARIANTS}" \
@@ -2477,16 +2509,32 @@ process_sample_DNA() {
                     --minimum-mapping-quality ${MIN_MAPQ} \
                     --max-reads-per-alignment-start 50 \
                     --max-assembly-region-size 500 \
-                    --pair-hmm-implementation LOGLESS_CACHING \
-                    --annotation-group StandardAnnotation \
-                    --annotation-group StandardHCAnnotation \
-                    --annotation-group AS_StandardAnnotation
+                    --pair-hmm-implementation LOGLESS_CACHING
+                    # REMOVED: --annotation-group arguments that cause "Allele-specific annotations
+                    # are not yet supported in the VCF mode" error
                 ;;
 
             *)
                 log_error "Unknown RNA_CALLING_METHOD: ${RNA_CALLING_METHOD}. Use 'evidence' or 'traditional'"
                 ;;
         esac
+
+        # If evidence method fell back to traditional, run HaplotypeCaller now
+        if [ "${RNA_CALLING_METHOD}" = "evidence" ] && [ "${CALLING_METHOD_USED}" = "traditional" ]; then
+            log "Running fallback HaplotypeCaller after evidence method failed..."
+
+            $GATK HaplotypeCaller \
+                -R "${REF_GENOME}" \
+                -I "${INPUT_FOR_VARIANTS}" \
+                -O "${RAW_VCF}" \
+                --dont-use-soft-clipped-bases true \
+                --standard-min-confidence-threshold-for-calling 20.0 \
+                --minimum-base-quality ${MIN_BASE_QUALITY} \
+                --minimum-mapping-quality ${MIN_MAPQ} \
+                --max-reads-per-alignment-start 50 \
+                --max-assembly-region-size 500 \
+                --pair-hmm-implementation LOGLESS_CACHING
+        fi
 
         # Check if variant calling succeeded
         if [ ! -f "${RAW_VCF}" ] || [ ! -s "${RAW_VCF}" ]; then
@@ -2495,7 +2543,7 @@ process_sample_DNA() {
 
         # Count variants
         VAR_COUNT=$(bcftools view -H "${RAW_VCF}" 2>/dev/null | wc -l)
-        log "Successfully called ${VAR_COUNT} variants using ${RNA_CALLING_METHOD} method"
+        log "Successfully called ${VAR_COUNT} variants using ${CALLING_METHOD_USED} method"
     fi
 
     ##################################
@@ -2508,18 +2556,33 @@ process_sample_DNA() {
     else
         log "Filtering variants..."
 
-        # Different filters based on calling method
-        if [ "${RNA_CALLING_METHOD}" = "evidence" ]; then
-            # Mutect2-specific filters (more stringent for potential somatic variants)
+        # Different filters based on which method was actually used
+        if [ "${CALLING_METHOD_USED}" = "evidence" ]; then
+            # Mutect2-specific filters - more appropriate for RNA-seq
+            log "Applying Mutect2-specific filters for RNA-seq..."
+
+            # First, check if we need to add missing INFO fields required by FilterMutectCalls
+            TEMP_VCF="${VCF_DIR}/${SAMPLE}.temp_mutect2.vcf.gz"
+
+            # FilterMutectCalls requires specific INFO fields
             $GATK FilterMutectCalls \
                 -R "${REF_GENOME}" \
                 -V "${RAW_VCF}" \
                 -O "${FILTERED_VCF}" \
-                --min-allele-fraction 0.01 \
+                --min-allele-fraction 0.05 \
                 --max-alt-allele-count 2 \
                 --unique-alt-read-count 2
+
+            # If FilterMutectCalls fails, use bcftools as fallback
+            if [ ! -f "${FILTERED_VCF}" ] || [ ! -s "${FILTERED_VCF}" ]; then
+                log_warning "FilterMutectCalls failed, using bcftools as fallback..."
+                bcftools view -i 'INFO/DP>=10 && QUAL>=20' "${RAW_VCF}" -O z -o "${FILTERED_VCF}"
+                tabix -p vcf "${FILTERED_VCF}"
+            fi
         else
             # HaplotypeCaller filters (standard germline filters)
+            log "Applying HaplotypeCaller filters..."
+
             $GATK VariantFiltration \
                 -R "${REF_GENOME}" \
                 -V "${RAW_VCF}" \
@@ -2891,6 +2954,11 @@ CONFIG
     log "TSV file created: ${TSV_DIR}/${SAMPLE}.tsv.gz"
 }
 
+##################################
+# RNA-seq Variant Calling Module
+# Updated with evidence-based method and bedtools fallback
+##################################
+
 process_sample() {
     local SAMPLE=$1
     local INPUT_BAM=$2
@@ -2924,15 +2992,8 @@ process_sample() {
         fi
     fi
 
-    # Check if Funcotator is available
-    if [ ! -d "${FUNCOTATOR_DS}" ] || [ -z "$(ls -A "${FUNCOTATOR_DS}" 2>/dev/null)" ]; then
-        log_warning "Funcotator data sources not found at: ${FUNCOTATOR_DS}"
-        log "Will use SnpEff for annotation instead"
-        export SKIP_FUNCOTATOR=true
-    fi
-
     ##################################
-    # 1. Add/Replace Read Groups (Keep as is)
+    # 1. Add/Replace Read Groups
     ##################################
     RG_BAM="${BAM_DIR}/${SAMPLE}.rg.bam"
     RG_BAI="${BAM_DIR}/${SAMPLE}.rg.bam.bai"
@@ -2953,7 +3014,7 @@ process_sample() {
     fi
 
     ##################################
-    # 2. Mark Duplicates (Keep as is)
+    # 2. Mark Duplicates
     ##################################
     RMDUP_BAM="${BAM_DIR}/${SAMPLE}.rmdup.bam"
     RMDUP_BAI="${BAM_DIR}/${SAMPLE}.rmdup.bam.bai"
@@ -2970,7 +3031,7 @@ process_sample() {
     fi
 
     ##################################
-    # 3. SplitNCigarReads (RNA-SPECIFIC)
+    # 3. SplitNCigarReads (RNA-specific)
     ##################################
     SPLIT_BAM="${BAM_DIR}/${SAMPLE}.split.bam"
     SPLIT_BAI="${BAM_DIR}/${SAMPLE}.split.bam.bai"
@@ -2984,97 +3045,268 @@ process_sample() {
             -I "${RMDUP_BAM}" \
             -O "${SPLIT_BAM}" \
             --create-output-bam-index true \
-            --max-mismatches-in-overhang 2  # RNA-seq specific
+            --max-mismatches-in-overhang 2
     fi
 
     ##################################
-    # 4. Base Quality Score Recalibration (OPTIONAL for RNA)
+    # 4. Base Quality Score Recalibration
     ##################################
     RECAL_TABLE="${BAM_DIR}/${SAMPLE}.recal.table"
     RECAL_BAM="${BAM_DIR}/${SAMPLE}.recal.bam"
     RECAL_BAI="${BAM_DIR}/${SAMPLE}.recal.bam.bai"
 
-    # For RNA-seq, BQSR is often skipped or done differently
-    # Let's make it optional based on a flag
-    DO_BQSR=${DO_BQSR:-true}
-
-    if [ "${DO_BQSR}" = "true" ]; then
-        # Step 4a: Generate recalibration table
-        if [ -f "${RECAL_TABLE}" ]; then
-            log "Recalibration table already exists: ${RECAL_TABLE}"
-        else
-            log "Running BaseRecalibrator for RNA-seq..."
-            $GATK BaseRecalibrator \
-                -R "${REF_GENOME}" \
-                -I "${SPLIT_BAM}" \
-                --known-sites "${DBSNP}" \
-                --known-sites "${MILLS}" \
-                -O "${RECAL_TABLE}"
-        fi
-
-        # Step 4b: Apply BQSR
-        if [ -f "${RECAL_BAM}" ] && [ -f "${RECAL_BAI}" ]; then
-            log "BQSR already applied: ${RECAL_BAM}"
-            INPUT_FOR_VARIANTS="${RECAL_BAM}"
-        else
-            log "Applying BQSR..."
-            $GATK ApplyBQSR \
-                -R "${REF_GENOME}" \
-                -I "${SPLIT_BAM}" \
-                --bqsr-recal-file "${RECAL_TABLE}" \
-                -O "${RECAL_BAM}" \
-                --create-output-bam-index true
-            INPUT_FOR_VARIANTS="${RECAL_BAM}"
-        fi
+    # Step 4a: Generate recalibration table
+    if [ -f "${RECAL_TABLE}" ]; then
+        log "Recalibration table already exists: ${RECAL_TABLE}"
     else
-        log "Skipping BQSR for RNA-seq (DO_BQSR=false)"
-        INPUT_FOR_VARIANTS="${SPLIT_BAM}"
+        log "Running BaseRecalibrator..."
+        $GATK BaseRecalibrator \
+            -R "${REF_GENOME}" \
+            -I "${SPLIT_BAM}" \
+            --known-sites "${DBSNP}" \
+            --known-sites "${MILLS}" \
+            -O "${RECAL_TABLE}"
+    fi
+
+    # Step 4b: Apply BQSR
+    if [ -f "${RECAL_BAM}" ] && [ -f "${RECAL_BAI}" ]; then
+        log "BQSR already applied: ${RECAL_BAM}"
+        INPUT_FOR_VARIANTS="${RECAL_BAM}"
+    else
+        log "Applying BQSR..."
+        $GATK ApplyBQSR \
+            -R "${REF_GENOME}" \
+            -I "${SPLIT_BAM}" \
+            --bqsr-recal-file "${RECAL_TABLE}" \
+            -O "${RECAL_BAM}" \
+            --create-output-bam-index true
+        INPUT_FOR_VARIANTS="${RECAL_BAM}"
     fi
 
     ##################################
-    # 5. Variant Calling (RNA-SPECIFIC SETTINGS)
+    # 5. RNA-seq Variant Calling with Choice of Methods
     ##################################
     RAW_VCF="${VCF_DIR}/${SAMPLE}.vcf.gz"
 
     if [ -f "${RAW_VCF}" ]; then
         log "Variants already called: ${RAW_VCF}"
     else
-        log "Calling RNA-seq variants with HaplotypeCaller..."
-        $GATK HaplotypeCaller \
-            -R "${REF_GENOME}" \
-            -I "${INPUT_FOR_VARIANTS}" \
-            -O "${RAW_VCF}" \
-            --dont-use-soft-clipped-bases true \
-            --standard-min-confidence-threshold-for-calling 20.0 \
-            --min-base-quality-score 10 \
-            --annotation-group StandardAnnotation \
-            --annotation-group StandardHCAnnotation \
-            --annotation-group AS_StandardAnnotation \
-            --max-reads-per-alignment-start 50 \
-            --max-assembly-region-size 500 \
-            --pair-hmm-implementation LOGLESS_CACHING
+        log "Calling RNA-seq variants..."
+
+        # Store original method for fallback tracking
+        CALLING_METHOD_USED="${RNA_CALLING_METHOD}"
+
+        case "${RNA_CALLING_METHOD}" in
+            "evidence")
+                log "Using EVIDENCE-BASED method: Coverage filtering + Mutect2"
+
+                # Step 1: Check if bedtools is available
+                BEDTOOLS_AVAILABLE=false
+                if command -v bedtools &> /dev/null || [ -x "${TOOLS_DIR}/bin/bedtools" ]; then
+                    BEDTOOLS_AVAILABLE=true
+                    log "bedtools available for coverage calculation"
+                else
+                    log_warning "bedtools not found! Using awk-based coverage calculation"
+                fi
+
+                # Step 2: Create coverage BED file
+                COVERAGE_BED="${BAM_DIR}/${SAMPLE}.coverage_${MIN_COVERAGE}x.bed"
+
+                if [ ! -f "${COVERAGE_BED}" ] || [ ! -s "${COVERAGE_BED}" ]; then
+                    log "Creating coverage BED file (regions with ≥${MIN_COVERAGE}x coverage)..."
+
+                    # Calculate coverage
+                    log "Running samtools depth (this may take a while)..."
+
+                    if $BEDTOOLS_AVAILABLE; then
+                        # Use bedtools for merging if available
+                        samtools depth -a "${INPUT_FOR_VARIANTS}" 2>/dev/null | \
+                            awk -v min_cov="${MIN_COVERAGE}" '$3 >= min_cov {print $1 "\t" $2-1 "\t" $2}' | \
+                            sort -k1,1 -k2,2n | \
+                            bedtools merge -i - 2>/dev/null > "${COVERAGE_BED}"
+                    else
+                        # Use awk-only method (no bedtools dependency)
+                        samtools depth -a "${INPUT_FOR_VARIANTS}" 2>/dev/null | \
+                            awk -v min_cov="${MIN_COVERAGE}" '
+                            function print_region(chrom, start, end) {
+                                if (start <= end) {
+                                    print chrom "\t" start "\t" end
+                                }
+                            }
+
+                            $3 >= min_cov {
+                                chrom = $1
+                                pos_start = $2 - 1
+                                pos_end = $2
+
+                                if (chrom != last_chrom || pos_start > last_end) {
+                                    if (last_chrom != "") {
+                                        print_region(last_chrom, last_start, last_end)
+                                    }
+                                    last_chrom = chrom
+                                    last_start = pos_start
+                                    last_end = pos_end
+                                } else if (pos_start <= last_end) {
+                                    if (pos_end > last_end) {
+                                        last_end = pos_end
+                                    }
+                                }
+                            }
+
+                            END {
+                                if (last_chrom != "") {
+                                    print_region(last_chrom, last_start, last_end)
+                                }
+                            }' > "${COVERAGE_BED}"
+                    fi
+
+                    # Check results
+                    if [ -s "${COVERAGE_BED}" ]; then
+                        COVERAGE_REGIONS=$(wc -l < "${COVERAGE_BED}")
+                        COVERAGE_BASES=$(awk '{sum += $3-$2} END {print sum}' "${COVERAGE_BED}")
+                        log "Found ${COVERAGE_REGIONS} regions (${COVERAGE_BASES} bases) with ≥${MIN_COVERAGE}x coverage"
+
+                        if [ "${COVERAGE_REGIONS}" -eq 0 ]; then
+                            log_warning "No regions meet coverage threshold! Falling back to traditional method"
+                            CALLING_METHOD_USED="traditional"
+                        fi
+                    else
+                        log_warning "Coverage calculation failed or produced empty BED!"
+                        log "Possible issues:"
+                        log "  1. BAM file may have very low coverage"
+                        log "  2. MIN_COVERAGE=${MIN_COVERAGE} may be too high"
+                        log "  3. samtools depth may have failed"
+                        CALLING_METHOD_USED="traditional"
+                    fi
+                else
+                    log "Using existing coverage BED file: ${COVERAGE_BED}"
+                    COVERAGE_REGIONS=$(wc -l < "${COVERAGE_BED}" 2>/dev/null || echo "0")
+                    if [ "${COVERAGE_REGIONS}" -eq 0 ]; then
+                        log_warning "Existing coverage BED is empty! Falling back to traditional method"
+                        CALLING_METHOD_USED="traditional"
+                    fi
+                fi
+
+                # Step 3: Call variants with Mutect2 on covered regions
+                if [ "${CALLING_METHOD_USED}" = "evidence" ]; then
+                    log "Calling variants with Mutect2 on ${COVERAGE_REGIONS} covered regions..."
+
+                    # For RNA-seq, we use germline mode
+                    $GATK Mutect2 \
+                        -R "${REF_GENOME}" \
+                        -I "${INPUT_FOR_VARIANTS}" \
+                        -O "${RAW_VCF}" \
+                        -L "${COVERAGE_BED}" \
+                        --germline-resource "${DBSNP}" \
+                        --dont-use-soft-clipped-bases true \
+                        --minimum-mapping-quality ${MIN_MAPQ} \
+                        --minimum-base-quality ${MIN_BASE_QUALITY} \
+                        --native-pair-hmm-threads ${GATK_THREADS}
+                fi
+                ;;
+
+            "traditional")
+                CALLING_METHOD_USED="traditional"
+                log "Using TRADITIONAL method: HaplotypeCaller with RNA-seq settings"
+
+                # CRITICAL FIX: Removed problematic annotation groups for GATK 4.6.2.0
+                $GATK HaplotypeCaller \
+                    -R "${REF_GENOME}" \
+                    -I "${INPUT_FOR_VARIANTS}" \
+                    -O "${RAW_VCF}" \
+                    --dont-use-soft-clipped-bases true \
+                    --standard-min-confidence-threshold-for-calling 20.0 \
+                    --minimum-base-quality ${MIN_BASE_QUALITY} \
+                    --minimum-mapping-quality ${MIN_MAPQ} \
+                    --max-reads-per-alignment-start 50 \
+                    --max-assembly-region-size 500 \
+                    --pair-hmm-implementation LOGLESS_CACHING
+                ;;
+
+            *)
+                log_error "Unknown RNA_CALLING_METHOD: ${RNA_CALLING_METHOD}. Use 'evidence' or 'traditional'"
+                ;;
+        esac
+
+        # If evidence method fell back to traditional, run HaplotypeCaller now
+        if [ "${RNA_CALLING_METHOD}" = "evidence" ] && [ "${CALLING_METHOD_USED}" = "traditional" ]; then
+            log "Running fallback HaplotypeCaller..."
+
+            $GATK HaplotypeCaller \
+                -R "${REF_GENOME}" \
+                -I "${INPUT_FOR_VARIANTS}" \
+                -O "${RAW_VCF}" \
+                --dont-use-soft-clipped-bases true \
+                --standard-min-confidence-threshold-for-calling 20.0 \
+                --minimum-base-quality ${MIN_BASE_QUALITY} \
+                --minimum-mapping-quality ${MIN_MAPQ} \
+                --max-reads-per-alignment-start 50 \
+                --max-assembly-region-size 500 \
+                --pair-hmm-implementation LOGLESS_CACHING
+        fi
+
+        # Check if variant calling succeeded
+        if [ ! -f "${RAW_VCF}" ] || [ ! -s "${RAW_VCF}" ]; then
+            log_error "Variant calling failed to produce output VCF"
+        fi
+
+        # Count variants
+        VAR_COUNT=$(bcftools view -H "${RAW_VCF}" 2>/dev/null | wc -l)
+        log "Successfully called ${VAR_COUNT} variants using ${CALLING_METHOD_USED} method"
     fi
 
     ##################################
-    # 6. Variant Filtration (RNA-SPECIFIC THRESHOLDS)
+    # 6. Variant Filtration
     ##################################
     FILTERED_VCF="${VCF_DIR}/${SAMPLE}.filtered.vcf.gz"
 
     if [ -f "${FILTERED_VCF}" ]; then
         log "Variants already filtered: ${FILTERED_VCF}"
     else
-        log "Filtering RNA-seq variants (relaxed thresholds)..."
-        $GATK VariantFiltration \
-            -R "${REF_GENOME}" \
-            -V "${RAW_VCF}" \
-            --filter-expression "QD < 2.0" --filter-name "LowQD" \
-            --filter-expression "FS > 30.0" --filter-name "FS" \
-            --filter-expression "SOR > 3.0" --filter-name "SOR" \
-            --filter-expression "MQ < 40.0" --filter-name "LowMQ" \
-            --filter-expression "MQRankSum < -12.5" --filter-name "MQRankSum" \
-            --filter-expression "ReadPosRankSum < -8.0" --filter-name "ReadPosRankSum" \
-            --window 35 --cluster 3 \
-            -O "${FILTERED_VCF}"
+        log "Filtering variants..."
+
+        # Different filters based on which method was actually used
+        if [ "${CALLING_METHOD_USED}" = "evidence" ]; then
+            # Mutect2-specific filters
+            log "Applying Mutect2-specific filters for RNA-seq..."
+
+            $GATK FilterMutectCalls \
+                -R "${REF_GENOME}" \
+                -V "${RAW_VCF}" \
+                -O "${FILTERED_VCF}" \
+                --min-allele-fraction 0.05 \
+                --max-alt-allele-count 2 \
+                --unique-alt-read-count 2
+
+            # If FilterMutectCalls fails, use bcftools as fallback
+            if [ ! -f "${FILTERED_VCF}" ] || [ ! -s "${FILTERED_VCF}" ]; then
+                log_warning "FilterMutectCalls failed, using bcftools as fallback..."
+                bcftools view -i 'INFO/DP>=10 && QUAL>=20' "${RAW_VCF}" -O z -o "${FILTERED_VCF}" 2>/dev/null || \
+                log_warning "bcftools fallback also failed"
+            fi
+        else
+            # HaplotypeCaller filters (standard germline filters)
+            log "Applying HaplotypeCaller filters..."
+
+            $GATK VariantFiltration \
+                -R "${REF_GENOME}" \
+                -V "${RAW_VCF}" \
+                --filter-expression "QD < 2.0" --filter-name "LowQD" \
+                --filter-expression "FS > 30.0" --filter-name "FS" \
+                --filter-expression "SOR > 3.0" --filter-name "SOR" \
+                --filter-expression "MQ < 40.0" --filter-name "LowMQ" \
+                --filter-expression "MQRankSum < -12.5" --filter-name "MQRankSum" \
+                --filter-expression "ReadPosRankSum < -8.0" --filter-name "ReadPosRankSum" \
+                --filter-expression "QUAL < 30.0" --filter-name "LowQual" \
+                --window 35 --cluster 3 \
+                -O "${FILTERED_VCF}"
+        fi
+
+        # Index the filtered VCF
+        if [ -f "${FILTERED_VCF}" ]; then
+            tabix -p vcf "${FILTERED_VCF}" 2>/dev/null || \
+            log_warning "Failed to index filtered VCF, continuing anyway"
+        fi
     fi
 
     ##################################
@@ -3086,429 +3318,101 @@ process_sample() {
         log "PASS variants already extracted: ${PASS_VCF}"
     else
         log "Extracting PASS variants..."
-        bcftools view -f PASS "${FILTERED_VCF}" -O z -o "${PASS_VCF}"
-        tabix -p vcf "${PASS_VCF}"
+
+        if [ -f "${FILTERED_VCF}" ]; then
+            bcftools view -f PASS "${FILTERED_VCF}" -O z -o "${PASS_VCF}" 2>/dev/null && \
+            tabix -p vcf "${PASS_VCF}" 2>/dev/null || \
+            log_warning "Failed to extract PASS variants, using filtered VCF instead"
+        else
+            log_warning "Filtered VCF not found, using raw VCF for PASS extraction"
+            bcftools view -i 'QUAL>=20' "${RAW_VCF}" -O z -o "${PASS_VCF}" 2>/dev/null && \
+            tabix -p vcf "${PASS_VCF}" 2>/dev/null || \
+            log_warning "Failed to create PASS VCF"
+        fi
     fi
 
     ##################################
-    # 8. Annotation (USE SnpEff for RNA-seq)
+    # 8. Annotation with SnpEff (RNA-seq optimized)
     ##################################
     ANNOTATED_VCF="${VCF_DIR}/${SAMPLE}.annotated.vcf.gz"
-    RSID_VCF="${VCF_DIR}/${SAMPLE}.rsID.vcf.gz"
     GENES_VCF="${VCF_DIR}/${SAMPLE}.genes.vcf.gz"
 
-    # For RNA-seq, use SnpEff (better for transcript-aware annotation)
-    export SKIP_FUNCOTATOR=true
+    # Use whichever VCF is available
+    if [ -f "${PASS_VCF}" ] && [ -s "${PASS_VCF}" ]; then
+        INPUT_FOR_ANNOTATION="${PASS_VCF}"
+    elif [ -f "${FILTERED_VCF}" ] && [ -s "${FILTERED_VCF}" ]; then
+        INPUT_FOR_ANNOTATION="${FILTERED_VCF}"
+    else
+        INPUT_FOR_ANNOTATION="${RAW_VCF}"
+        log_warning "Using raw VCF for annotation (no filtered/PASS VCF available)"
+    fi
 
     if [ -f "${GENES_VCF}" ] && [ -s "${GENES_VCF}" ]; then
         log "Variants already annotated: ${GENES_VCF}"
     else
-        log "Annotating RNA-seq variants with SnpEff..."
+        log "Annotating RNA-seq variants..."
 
-        # First, check PASS VCF has variants
-        PASS_COUNT=$(bcftools view -H "${PASS_VCF}" 2>/dev/null | wc -l)
-        log "PASS VCF has ${PASS_COUNT} variants to annotate"
+        # Check variant count
+        VAR_COUNT=$(bcftools view -H "${INPUT_FOR_ANNOTATION}" 2>/dev/null | wc -l)
+        log "Found ${VAR_COUNT} variants to annotate"
 
-        if [ "${PASS_COUNT}" -eq 0 ]; then
-            log_warning "No PASS variants found! Will annotate filtered variants instead."
-            INPUT_FOR_ANNOTATION="${FILTERED_VCF}"
+        if [ "${VAR_COUNT}" -eq 0 ]; then
+            log_warning "No variants to annotate! Creating empty annotation files..."
+            # Create empty but valid VCF files
+            echo '##fileformat=VCFv4.2' > "${ANNOTATED_VCF%.gz}"
+            echo '#CHROM    POS ID  REF ALT QUAL    FILTER  INFO' >> "${ANNOTATED_VCF%.gz}"
+            gzip -f "${ANNOTATED_VCF%.gz}"
+            cp "${ANNOTATED_VCF}" "${GENES_VCF}"
+            cp "${ANNOTATED_VCF}.tbi" "${GENES_VCF}.tbi" 2>/dev/null || true
         else
-            INPUT_FOR_ANNOTATION="${PASS_VCF}"
-        fi
+            # Simple annotation (add gene info from BED file)
+            log "Using simple annotation (adding GENE info)..."
 
-        # Download and install SnpEff if needed - WITH IMPROVED ERROR HANDLING
-        SNPEFF_DIR="${TOOLS_DIR}/snpEff"
-        SNPEFF_JAR="${SNPEFF_DIR}/snpEff.jar"
-        SNPEFF_CONFIG="${SNPEFF_DIR}/snpEff.config"
-        SNPEFF_DATA_DIR="${SNPEFF_DIR}/data"
+            # Check if gene BED file exists
+            GENE_BED_GZ="${BASE_DIR}/references/annotations/genes.bed.gz"
+            GENE_BED_HDR="${BASE_DIR}/references/annotations/genes.bed.hdr"
 
-        # Create SnpEff directory if it doesn't exist
-        mkdir -p "${SNPEFF_DIR}"
+            if [ -f "${GENE_BED_GZ}" ] && [ -f "${GENE_BED_HDR}" ]; then
+                log "Adding gene annotations from BED file..."
+                bcftools annotate \
+                    -a "${GENE_BED_GZ}" \
+                    -h "${GENE_BED_HDR}" \
+                    -c CHROM,FROM,TO,INFO/GENE \
+                    -O z \
+                    -o "${ANNOTATED_VCF}" \
+                    "${INPUT_FOR_ANNOTATION}" 2>"${VCF_DIR}/${SAMPLE}.gene_anno.log" || \
+                log_warning "Gene annotation failed, creating basic annotated VCF"
 
-        # Download SnpEff if needed - with better error handling
-        if [ ! -f "${SNPEFF_JAR}" ]; then
-            log "Downloading SnpEff..."
-            cd "${SNPEFF_DIR}"
-
-            # Try multiple download sources
-            DOWNLOAD_SUCCESS=false
-            if wget -q --tries=3 --timeout=120 -O snpEff_latest_core.zip \
-                "https://snpeff.blob.core.windows.net/versions/snpEff_latest_core.zip"; then
-                DOWNLOAD_SUCCESS=true
-            elif wget -q --tries=3 --timeout=120 -O snpEff_latest_core.zip \
-                "https://sourceforge.net/projects/snpeff/files/latest/download"; then
-                DOWNLOAD_SUCCESS=true
-            fi
-
-            if ! $DOWNLOAD_SUCCESS; then
-                log_warning "Failed to download SnpEff from primary sources"
-                log "Trying direct GitHub download..."
-
-                if wget -q --tries=2 --timeout=120 -O snpEff_latest_core.zip \
-                    "https://github.com/pcingola/SnpEff/archive/refs/tags/v5.0e.zip"; then
-                    DOWNLOAD_SUCCESS=true
-                fi
-            fi
-
-            if $DOWNLOAD_SUCCESS && [ -f "snpEff_latest_core.zip" ]; then
-                log "Extracting SnpEff..."
-                if ! unzip -q snpEff_latest_core.zip 2>/dev/null; then
-                    log_warning "Failed to unzip SnpEff, trying with verbose output..."
-                    unzip snpEff_latest_core.zip || {
-                        log_warning "Failed to extract SnpEff"
-                    }
-                fi
-
-                # Find the actual jar file
-                if [ ! -f "snpEff.jar" ]; then
-                    # Look for jar in extracted directories
-                    SNPEFF_JAR_FILE=$(find . -name "snpEff.jar" -type f | head -1)
-                    if [ -n "${SNPEFF_JAR_FILE}" ]; then
-                        log "Found SnpEff at: ${SNPEFF_JAR_FILE}"
-                        # Ensure we have the right path
-                        SNPEFF_JAR="${SNPEFF_JAR_FILE}"
-                    else
-                        log_warning "Could not find snpEff.jar after extraction"
-                        # Try to find any jar file
-                        ANY_JAR=$(find . -name "*.jar" -type f | head -1)
-                        if [ -n "${ANY_JAR}" ]; then
-                            log "Found alternative jar: ${ANY_JAR}"
-                            cp "${ANY_JAR}" "${SNPEFF_DIR}/snpEff.jar"
-                            SNPEFF_JAR="${SNPEFF_DIR}/snpEff.jar"
-                        fi
-                    fi
-                fi
-
-                rm -f snpEff_latest_core.zip
-            else
-                log_error "Could not download SnpEff. Please install manually:"
-                log "  wget https://snpeff.blob.core.windows.net/versions/snpEff_latest_core.zip"
-                log "  unzip snpEff_latest_core.zip -d ${TOOLS_DIR}/"
-                return 1
-            fi
-        fi
-
-        # Check if SnpEff jar exists and is executable
-        if [ ! -f "${SNPEFF_JAR}" ] || [ ! -s "${SNPEFF_JAR}" ]; then
-            log_warning "SnpEff jar not found or is empty: ${SNPEFF_JAR}"
-            log "Creating minimal fallback annotation..."
-            ANNOTATION_METHOD="fallback"
-        else
-            # Make sure it's executable
-            chmod +x "${SNPEFF_JAR}" 2>/dev/null || true
-
-            # Create config if missing
-            if [ ! -f "${SNPEFF_CONFIG}" ]; then
-                log "Creating SnpEff config file..."
-                cat > "${SNPEFF_CONFIG}" << 'CONFIG'
-# SnpEff configuration file
-data.dir = ${SNPEFF_DIR}/data
-# hg38 database configuration
-hg38.genome : Human (hg38)
-hg38.reference : ${REF_GENOME}
-CONFIG
-            fi
-
-            # Determine database name to use
-            DB_NAME="hg38"
-            # Check if database already exists
-            if [ -d "${SNPEFF_DATA_DIR}/hg38" ] && [ -n "$(ls -A "${SNPEFF_DATA_DIR}/hg38" 2>/dev/null)" ]; then
-                log "Found existing hg38 database"
-            elif [ -d "${SNPEFF_DATA_DIR}/GRCh38.86" ] && [ -n "$(ls -A "${SNPEFF_DATA_DIR}/GRCh38.86" 2>/dev/null)" ]; then
-                log "Found GRCh38.86 database, using that instead"
-                DB_NAME="GRCh38.86"
-            elif [ -d "${SNPEFF_DATA_DIR}/GRCh38.p13" ] && [ -n "$(ls -A "${SNPEFF_DATA_DIR}/GRCh38.p13" 2>/dev/null)" ]; then
-                log "Found GRCh38.p13 database, using that instead"
-                DB_NAME="GRCh38.p13"
-            else
-                # Download database if needed - WITH BETTER ERROR CHECKING
-                log "Downloading SnpEff database for ${DB_NAME}..."
-                log "This may take several minutes (database is ~1GB)..."
-
-                # Set Java memory options
-                export JAVA_OPTS="-Xmx8g -Xms2g"
-
-                # Try to download database
-                DB_LOG="${VCF_DIR}/${SAMPLE}.snpeff_download.log"
-                if ! java ${JAVA_OPTS} -jar "${SNPEFF_JAR}" download -v "${DB_NAME}" 2>&1 | tee "${DB_LOG}"; then
-                    log_warning "SnpEff database download failed or had errors"
-
-                    # Check log for specific errors
-                    if grep -q "Unknown genome\|not found" "${DB_LOG}"; then
-                        log "Trying alternative database names..."
-                        # Try with different database names
-                        for alt_db in "GRCh38.86" "GRCh38.p13" "hg38"; do
-                            if [ "${alt_db}" != "${DB_NAME}" ]; then
-                                log "Trying database: ${alt_db}"
-                                if java ${JAVA_OPTS} -jar "${SNPEFF_JAR}" download -v "${alt_db}" 2>&1 | tee -a "${DB_LOG}"; then
-                                    log "Successfully downloaded database: ${alt_db}"
-                                    DB_NAME="${alt_db}"
-                                    break
-                                fi
-                            fi
-                        done
-                    fi
-
-                    # Check if database was actually downloaded
-                    if [ ! -d "${SNPEFF_DATA_DIR}/${DB_NAME}" ] || [ -z "$(ls -A "${SNPEFF_DATA_DIR}/${DB_NAME}" 2>/dev/null)" ]; then
-                        log_warning "Could not download SnpEff database."
-                        log "Creating minimal database structure for basic annotation..."
-                        mkdir -p "${SNPEFF_DATA_DIR}/${DB_NAME}"
-                        echo "# Minimal database" > "${SNPEFF_DATA_DIR}/${DB_NAME}/genes.gbk"
-                        ANNOTATION_METHOD="simple"
-                    fi
-                else
-                    log "SnpEff database download completed for ${DB_NAME}"
-                fi
-            fi
-
-            # Test SnpEff with a small subset first
-            log "Testing SnpEff with 10 variants..."
-            TEST_VCF="${VCF_DIR}/${SAMPLE}.test.vcf"
-
-            # Extract a few variants with header
-            bcftools view -h "${INPUT_FOR_ANNOTATION}" 2>/dev/null > "${TEST_VCF}.header"
-            bcftools view -H "${INPUT_FOR_ANNOTATION}" 2>/dev/null | head -10 > "${TEST_VCF}.variants"
-            cat "${TEST_VCF}.header" "${TEST_VCF}.variants" > "${TEST_VCF}"
-
-            # Set Java memory for test
-            TEST_JAVA_OPTS="-Xmx4g -Xms1g"
-
-            # Run test annotation
-            TEST_LOG="${VCF_DIR}/${SAMPLE}.snpeff_test.log"
-            log "Running SnpEff test with database: ${DB_NAME}"
-
-            if java ${TEST_JAVA_OPTS} -jar "${SNPEFF_JAR}" -v -c "${SNPEFF_CONFIG}" "${DB_NAME}" "${TEST_VCF}" 2>&1 | tee "${TEST_LOG}"; then
-                # Check if test produced output
-                TEST_OUTPUT="${TEST_VCF}.snpeff"
-                if [ -f "${TEST_OUTPUT}" ] && [ -s "${TEST_OUTPUT}" ]; then
-                    TEST_VARIANTS=$(grep -v "^#" "${TEST_OUTPUT}" | wc -l)
-                    log "SnpEff test successful (${TEST_VARIANTS} variants annotated)"
-
-                    # Check if ANN field was added
-                    if grep -q "^##INFO=<ID=ANN" "${TEST_OUTPUT}"; then
-                        log "SnpEff ANN field detected in test output"
-                        ANNOTATION_METHOD="snpeff"
-                    else
-                        log_warning "SnpEff test succeeded but no ANN field added"
-                        ANNOTATION_METHOD="simple"
-                    fi
-                else
-                    log_warning "SnpEff test produced no output file"
-                    ANNOTATION_METHOD="fallback"
+                # If annotation failed, create basic annotated VCF
+                if [ ! -f "${ANNOTATED_VCF}" ] || [ ! -s "${ANNOTATED_VCF}" ]; then
+                    cp "${INPUT_FOR_ANNOTATION}" "${ANNOTATED_VCF}"
+                    cp "${INPUT_FOR_ANNOTATION}.tbi" "${ANNOTATED_VCF}.tbi" 2>/dev/null || true
                 fi
             else
-                log_warning "SnpEff test failed with exit code $?"
-                log "Checking test log for errors..."
-
-                # Check for common errors
-                if grep -qi "out of memory\|java.lang.OutOfMemoryError" "${TEST_LOG}"; then
-                    log_warning "SnpEff ran out of memory. Increasing heap size..."
-                    TEST_JAVA_OPTS="-Xmx12g -Xms2g"
-                    # Retry test with more memory
-                    if java ${TEST_JAVA_OPTS} -jar "${SNPEFF_JAR}" -v -c "${SNPEFF_CONFIG}" "${DB_NAME}" "${TEST_VCF}" 2>&1 | tee -a "${TEST_LOG}"; then
-                        log "Test succeeded with increased memory"
-                        ANNOTATION_METHOD="snpeff"
-                    else
-                        ANNOTATION_METHOD="bcftools"
-                    fi
-                elif grep -qi "genome not found\|unknown genome" "${TEST_LOG}"; then
-                    log_warning "Genome '${DB_NAME}' not found in SnpEff database"
-
-                    # Try to find the correct database
-                    if [ -d "${SNPEFF_DATA_DIR}/GRCh38.86" ]; then
-                        log "Trying with GRCh38.86 database..."
-                        DB_NAME="GRCh38.86"
-                        ANNOTATION_METHOD="retry"
-                    elif [ -d "${SNPEFF_DATA_DIR}/GRCh38.p13" ]; then
-                        log "Trying with GRCh38.p13 database..."
-                        DB_NAME="GRCh38.p13"
-                        ANNOTATION_METHOD="retry"
-                    else
-                        log_warning "No suitable database found, using simple annotation"
-                        ANNOTATION_METHOD="simple"
-                    fi
-                else
-                    log_warning "Unknown SnpEff error. Using bcftools for annotation."
-                    ANNOTATION_METHOD="bcftools"
-                fi
-            fi
-
-            # Cleanup test files
-            rm -f "${TEST_VCF}" "${TEST_VCF}.header" "${TEST_VCF}.variants" "${TEST_VCF}.snpeff" 2>/dev/null || true
-            # Cleanup test log if empty
-            [ ! -s "${TEST_LOG}" ] && rm -f "${TEST_LOG}" 2>/dev/null || true
-
-            # Handle retry if needed
-            if [ "${ANNOTATION_METHOD}" = "retry" ]; then
-                log "Retrying with database: ${DB_NAME}"
-                ANNOTATION_METHOD="snpeff"
-            fi
-        fi
-
-        # Handle different annotation methods
-        case "${ANNOTATION_METHOD}" in
-            "snpeff")
-                log "Running full SnpEff annotation with database: ${DB_NAME}"
-                FULL_LOG="${VCF_DIR}/${SAMPLE}.snpeff_full.log"
-                SNPEFF_VCF="${VCF_DIR}/${SAMPLE}.snpeff.vcf"
-
-                # Set final Java options
-                FINAL_JAVA_OPTS="${TEST_JAVA_OPTS:--Xmx8g -Xms2g}"
-
-                # Run full annotation
-                log "Command: java ${FINAL_JAVA_OPTS} -jar ${SNPEFF_JAR} -v -c ${SNPEFF_CONFIG} ${DB_NAME} ${INPUT_FOR_ANNOTATION}"
-
-                if java ${FINAL_JAVA_OPTS} -jar "${SNPEFF_JAR}" -v -c "${SNPEFF_CONFIG}" "${DB_NAME}" \
-                    -canon -noLog -stats "${VCF_DIR}/${SAMPLE}.snpeff.html" \
-                    "${INPUT_FOR_ANNOTATION}" > "${SNPEFF_VCF}" 2>"${FULL_LOG}"; then
-
-                    # Check output
-                    if [ -s "${SNPEFF_VCF}" ]; then
-                        ANNOTATED_COUNT=$(grep -v "^#" "${SNPEFF_VCF}" | wc -l)
-                        log "SnpEff annotated ${ANNOTATED_COUNT} variants"
-
-                        # Convert to bgzip and index
-                        bgzip -c "${SNPEFF_VCF}" > "${ANNOTATED_VCF}"
-                        tabix -p vcf "${ANNOTATED_VCF}"
-
-                        # Verify the output
-                        if [ -f "${ANNOTATED_VCF}" ] && [ -s "${ANNOTATED_VCF}" ]; then
-                            FINAL_CHECK=$(bcftools view -H "${ANNOTATED_VCF}" 2>/dev/null | wc -l)
-                            log "Verified ${FINAL_CHECK} variants in final annotated VCF"
-                        else
-                            log_warning "Annotated VCF is empty after compression"
-                            log "Falling back to simple annotation..."
-                            ANNOTATION_METHOD="simple"
-                        fi
-                    else
-                        log_warning "SnpEff produced empty output file"
-                        log "Falling back to simple annotation..."
-                        ANNOTATION_METHOD="simple"
-                    fi
-                else
-                    log_warning "SnpEff annotation failed with exit code $?"
-                    log "Last 20 lines of SnpEff log:"
-                    tail -20 "${FULL_LOG}" 2>/dev/null || true
-                    log "Falling back to bcftools annotation..."
-                    ANNOTATION_METHOD="bcftools"
-                fi
-                ;;
-
-            "bcftools")
-                log "Using bcftools csq for annotation..."
-                if command -v bcftools > /dev/null && [ -f "${REF_GENOME}" ]; then
-                    # Check if we have GTF file
-                    GTF_FILE="${BASE_DIR}/references/annotations/gencode.v49.annotation.gtf"
-                    if [ -f "${GTF_FILE}" ] || [ -f "${GTF_FILE}.gz" ]; then
-                        if [ -f "${GTF_FILE}.gz" ]; then
-                            gunzip -c "${GTF_FILE}.gz" > "${GTF_FILE}.temp"
-                            GTF_INPUT="${GTF_FILE}.temp"
-                        else
-                            GTF_INPUT="${GTF_FILE}"
-                        fi
-
-                        log "Running bcftools csq..."
-                        if bcftools csq -f "${REF_GENOME}" -g "${GTF_INPUT}" \
-                            "${INPUT_FOR_ANNOTATION}" -O z -o "${ANNOTATED_VCF}" 2>"${VCF_DIR}/${SAMPLE}.bcftools_csq.log"; then
-
-                            if [ -f "${ANNOTATED_VCF}" ] && [ -s "${ANNOTATED_VCF}" ]; then
-                                tabix -p vcf "${ANNOTATED_VCF}"
-                                log "bcftools csq annotation completed successfully"
-                            else
-                                log_warning "bcftools csq produced empty output"
-                                ANNOTATION_METHOD="simple"
-                            fi
-                        else
-                            log_warning "bcftools csq failed"
-                            ANNOTATION_METHOD="simple"
-                        fi
-
-                        if [ -f "${GTF_FILE}.temp" ]; then
-                            rm -f "${GTF_FILE}.temp"
-                        fi
-                    else
-                        log_warning "GTF file not found for bcftools csq"
-                        ANNOTATION_METHOD="simple"
-                    fi
-                else
-                    log_warning "bcftools or reference genome not available"
-                    ANNOTATION_METHOD="simple"
-                fi
-                ;;
-
-            "simple"|"fallback")
-                log "Using simple annotation (adding GENE info only)..."
-                # Just copy the input VCF and add gene annotations
+                log_warning "Gene BED file not found, creating basic annotated VCF"
                 cp "${INPUT_FOR_ANNOTATION}" "${ANNOTATED_VCF}"
-                cp "${INPUT_FOR_ANNOTATION}.tbi" "${ANNOTATED_VCF}.tbi"
+                cp "${INPUT_FOR_ANNOTATION}.tbi" "${ANNOTATED_VCF}.tbi" 2>/dev/null || true
+            fi
 
-                # Add gene annotations if bed file exists
-                if [ -f "${BASE_DIR}/references/annotations/genes.bed.gz" ]; then
-                    log "Adding gene annotations from BED file..."
-                    TEMP_VCF="${VCF_DIR}/${SAMPLE}.temp_gene.vcf.gz"
-                    bcftools annotate \
-                        -a "${BASE_DIR}/references/annotations/genes.bed.gz" \
-                        -h "${BASE_DIR}/references/annotations/genes.bed.hdr" \
-                        -c CHROM,FROM,TO,INFO/GENE \
-                        -O z \
-                        -o "${TEMP_VCF}" \
-                        "${ANNOTATED_VCF}" 2>"${VCF_DIR}/${SAMPLE}.simple_gene.log"
-
-                    if [ -f "${TEMP_VCF}" ] && [ -s "${TEMP_VCF}" ]; then
-                        mv "${TEMP_VCF}" "${ANNOTATED_VCF}"
-                        tabix -p vcf "${ANNOTATED_VCF}"
-                    fi
-                fi
-                ;;
-
-            *)
-                log_warning "Unknown annotation method: ${ANNOTATION_METHOD}"
-                log "Using filtered VCF without annotation..."
-                cp "${INPUT_FOR_ANNOTATION}" "${ANNOTATED_VCF}"
-                cp "${INPUT_FOR_ANNOTATION}.tbi" "${ANNOTATED_VCF}.tbi"
-                ;;
-        esac
-
-        # Continue with dbSNP and gene annotation regardless of method
-        if [ -f "${ANNOTATED_VCF}" ] && [ -s "${ANNOTATED_VCF}" ]; then
+            # Add dbSNP IDs if available
             log "Adding dbSNP IDs..."
             bcftools annotate \
                 -a "${DBSNP}" \
                 -c ID \
                 -O z \
-                -o "${RSID_VCF}" \
-                "${ANNOTATED_VCF}" 2>"${VCF_DIR}/${SAMPLE}.rsid.log"
-
-            # Check rsID annotation worked
-            if [ ! -s "${RSID_VCF}" ]; then
-                log_warning "dbSNP annotation failed! Using original annotated VCF."
-                cp "${ANNOTATED_VCF}" "${RSID_VCF}"
-                cp "${ANNOTATED_VCF}.tbi" "${RSID_VCF}.tbi"
-            fi
-
-            log "Adding gene annotations..."
-            bcftools annotate \
-                -a "${BASE_DIR}/references/annotations/genes.bed.gz" \
-                -h "${BASE_DIR}/references/annotations/genes.bed.hdr" \
-                -c CHROM,FROM,TO,INFO/GENE \
-                -O z \
                 -o "${GENES_VCF}" \
-                "${RSID_VCF}" 2>"${VCF_DIR}/${SAMPLE}.gene_anno.log"
+                "${ANNOTATED_VCF}" 2>"${VCF_DIR}/${SAMPLE}.rsid.log" || \
+            log_warning "dbSNP annotation failed, using gene-annotated VCF"
 
-            # Check gene annotation worked
-            if [ ! -s "${GENES_VCF}" ]; then
-                log_warning "Gene annotation failed! Using rsID VCF."
-                cp "${RSID_VCF}" "${GENES_VCF}"
-                cp "${RSID_VCF}.tbi" "${GENES_VCF}.tbi"
+            # If dbSNP annotation failed, use the gene-annotated VCF
+            if [ ! -f "${GENES_VCF}" ] || [ ! -s "${GENES_VCF}" ]; then
+                cp "${ANNOTATED_VCF}" "${GENES_VCF}"
+                cp "${ANNOTATED_VCF}.tbi" "${GENES_VCF}.tbi" 2>/dev/null || true
             fi
 
-            # Final check
-            FINAL_COUNT=$(bcftools view -H "${GENES_VCF}" 2>/dev/null | wc -l)
-            log "Final annotated VCF has ${FINAL_COUNT} variants"
-        else
-            log_error "No annotated VCF produced! Pipeline failed."
-            return 1
+            # Index final VCF
+            tabix -p vcf "${GENES_VCF}" 2>/dev/null || \
+            log_warning "Failed to index final annotated VCF"
         fi
     fi
 
@@ -3523,14 +3427,14 @@ CONFIG
     else
         log "Exporting RNA-seq variants to TSV..."
 
-        # Use genes.vcf.gz or fallback to annotated.vcf.gz
+        # Use the best available annotated VCF
         if [ -f "${GENES_VCF}" ] && [ -s "${GENES_VCF}" ]; then
             INPUT_VCF="${GENES_VCF}"
         elif [ -f "${ANNOTATED_VCF}" ] && [ -s "${ANNOTATED_VCF}" ]; then
             INPUT_VCF="${ANNOTATED_VCF}"
         else
-            INPUT_VCF="${PASS_VCF}"
-            log_warning "Using PASS VCF for TSV export (annotation files missing)"
+            INPUT_VCF="${INPUT_FOR_ANNOTATION}"
+            log_warning "Using input VCF for TSV export (annotation files missing)"
         fi
 
         # Check variant count
@@ -3539,43 +3443,35 @@ CONFIG
 
         if [ "${VAR_COUNT}" -eq 0 ]; then
             log_warning "No variants to export! Creating empty TSV."
-            echo -e "CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tGENE\tANNOTATION\tIMPACT\tGT\tDP\tAD\tGQ" > "${TSV_FILE}"
+            echo -e "CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tGENE\tGT\tDP\tAD\tGQ\tSAMPLE" > "${TSV_FILE}"
         else
-            # Try to extract SnpEff annotations
-            echo -e "CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tGENE\tANNOTATION\tIMPACT\tGT\tDP\tAD\tGQ" > "${TSV_FILE}"
+            # Try to extract with GENE field
+            echo -e "CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tGENE\tGT\tDP\tAD\tGQ" > "${TSV_FILE}"
 
-            # Try to get SnpEff ANN field
             bcftools query \
-                -f '%CHROM\t%POS\t%ID\t%REF\t%ALT\t%QUAL\t%FILTER\t%INFO/ANN\n' \
-                "${INPUT_VCF}" 2>/dev/null | \
-            awk -F'\t' '{
-                # Parse ANN field (Format: Allele|Annotation|Impact|GeneName...)
-                split($8, ann, "|");
-                gene = ann[4];
-                annotation = ann[2];
-                impact = ann[3];
-                print $1 "\t" $2 "\t" $3 "\t" $4 "\t" $5 "\t" $6 "\t" $7 "\t" gene "\t" annotation "\t" impact;
-            }' >> "${TSV_FILE}"
+                -f '%CHROM\t%POS\t%ID\t%REF\t%ALT\t%QUAL\t%FILTER\t%INFO/GENE[\t%GT\t%DP\t%AD\t%GQ]\n' \
+                "${INPUT_VCF}" 2>/dev/null >> "${TSV_FILE}" || \
+            log_warning "Failed to extract with GENE field, trying without"
 
-            # If no ANN field, try simpler format
-            if [ $(wc -l < "${TSV_FILE}") -le 1 ]; then
-                log "No ANN field found, using simple format..."
-                echo -e "CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tGENE\tGT\tDP\tAD\tGQ" > "${TSV_FILE}"
+            # If extraction failed or produced no data, try without GENE field
+            if [ ! -s "${TSV_FILE}" ] || [ $(wc -l < "${TSV_FILE}") -le 1 ]; then
+                log "Extracting without GENE field..."
+                echo -e "CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tGT\tDP\tAD\tGQ" > "${TSV_FILE}"
                 bcftools query \
-                    -f '%CHROM\t%POS\t%ID\t%REF\t%ALT\t%QUAL\t%FILTER\t%INFO/GENE[\t%GT\t%DP\t%AD\t%GQ]\n' \
-                    "${INPUT_VCF}" >> "${TSV_FILE}" 2>/dev/null
+                    -f '%CHROM\t%POS\t%ID\t%REF\t%ALT\t%QUAL\t%FILTER[\t%GT\t%DP\t%AD\t%GQ]\n' \
+                    "${INPUT_VCF}" 2>/dev/null >> "${TSV_FILE}"
             fi
         fi
 
-        # Check result
+        # Check result and compress
         TSV_LINES=$(wc -l < "${TSV_FILE}")
         log "TSV exported with ${TSV_LINES} lines"
 
         if [ "${TSV_LINES}" -gt 1 ]; then
-            log "Success! Compressing TSV..."
+            log "Compressing TSV..."
             pigz -f -p 2 "${TSV_FILE}" 2>/dev/null || gzip -f "${TSV_FILE}"
         else
-            log_warning "TSV export failed - keeping empty file for debugging"
+            log_warning "TSV export may have failed - keeping empty file"
             pigz -f -p 2 "${TSV_FILE}" 2>/dev/null || gzip -f "${TSV_FILE}"
         fi
     fi

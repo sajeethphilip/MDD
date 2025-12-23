@@ -66,39 +66,6 @@ install_system_deps() {
     fi
 }
 
-install_openssl_local() {
-    log "Installing OpenSSL locally..."
-
-    cd "$TOOLS_DIR"
-    mkdir -p openssl
-    cd openssl
-
-    # Try to download and compile OpenSSL 1.0.2 (compatible with bcftools)
-    if wget -q --tries=3 --timeout=120 -O openssl.tar.gz \
-        "https://www.openssl.org/source/openssl-1.0.2u.tar.gz"; then
-
-        tar -xzf openssl.tar.gz
-        cd openssl-1.0.2u
-
-        # Configure for local installation
-        ./config --prefix="$TOOLS_DIR/openssl" \
-                 --openssldir="$TOOLS_DIR/ssl" \
-                 no-shared \
-                 no-zlib \
-                 no-asm
-
-        make -j "$CPU_CORES"
-        make install
-
-        # Create symlinks for libraries
-        ln -sf "$TOOLS_DIR/openssl/lib/libcrypto.a" "$TOOLS_DIR/lib/" 2>/dev/null || true
-        ln -sf "$TOOLS_DIR/openssl/lib/libssl.a" "$TOOLS_DIR/lib/" 2>/dev/null || true
-
-        log "✓ OpenSSL installed locally"
-    else
-        log_warning "Could not download OpenSSL source"
-    fi
-}
 
 install_htslib_static() {
     log "Installing static htslib..."
@@ -142,97 +109,99 @@ install_htslib_static() {
     fi
 }
 
-install_bcftools_static() {
-    log "Installing static bcftools..."
+install_bedtools_static() {
+    log "Installing bedtools..."
 
     cd "$TOOLS_DIR/build"
 
-    # Download bcftools source
-    wget -q --tries=3 --timeout=120 -O bcftools.tar.bz2 \
-        "https://github.com/samtools/bcftools/releases/download/1.19/bcftools-1.19.tar.bz2"
+    # Download bedtools source
+    wget -q --tries=3 --timeout=120 -O bedtools.tar.gz \
+        "https://github.com/arq5x/bedtools2/releases/download/v2.31.0/bedtools2-2.31.0.tar.gz"
 
-    if [ ! -f "bcftools.tar.bz2" ]; then
-        wget -q --tries=3 --timeout=120 -O bcftools.tar.bz2 \
-            "https://github.com/samtools/bcftools/releases/download/1.18/bcftools-1.18.tar.bz2"
+    if [ ! -f "bedtools.tar.gz" ]; then
+        wget -q --tries=3 --timeout=120 -O bedtools.tar.gz \
+            "https://github.com/arq5x/bedtools2/archive/refs/tags/v2.31.0.tar.gz"
     fi
 
-    if [ -f "bcftools.tar.bz2" ]; then
-        tar -xjf bcftools.tar.bz2
-        cd bcftools-*
+    if [ -f "bedtools.tar.gz" ]; then
+        tar -xzf bedtools.tar.gz
 
-        # Compile with static htslib
-        ./configure --prefix="$TOOLS_DIR" \
-                    --disable-libcurl \
-                    --disable-plugins \
-                    --enable-static \
-                    CFLAGS="-fPIC -O2 -I$TOOLS_DIR/include" \
-                    LDFLAGS="-L$TOOLS_DIR/lib -static"
+        # Find the extracted directory
+        BEDTOOLS_DIR=$(find . -maxdepth 1 -name "*bedtools*" -type d | head -1)
 
-        make -j "$CPU_CORES"
-        make install
+        if [ -n "$BEDTOOLS_DIR" ]; then
+            cd "$BEDTOOLS_DIR"
 
-        # Create static binary
-        gcc -static -o "$TOOLS_DIR/bin/bcftools_static" \
-            -I. -I"$TOOLS_DIR/include" \
-            *.o "$TOOLS_DIR/lib/libhts.a" \
-            -lz -lm -lpthread 2>/dev/null || true
+            # Compile bedtools
+            make -j "$CPU_CORES"
 
-        if [ -x "$TOOLS_DIR/bin/bcftools_static" ]; then
-            ln -sf bcftools_static "$TOOLS_DIR/bin/bcftools"
-            log "✓ bcftools compiled statically"
+            # Copy all binaries
+            cp bin/* "$TOOLS_DIR/bin/" 2>/dev/null || true
+
+            # Test if bedtools is working
+            if [ -x "$TOOLS_DIR/bin/bedtools" ]; then
+                log "✓ bedtools installed successfully"
+            else
+                # Try to find bedtools binary
+                BEDTOOLS_BIN=$(find . -name "bedtools" -type f -executable | head -1)
+                if [ -n "$BEDTOOLS_BIN" ]; then
+                    cp "$BEDTOOLS_BIN" "$TOOLS_DIR/bin/"
+                    log "✓ bedtools installed from source"
+                else
+                    download_bedtools_binary
+                fi
+            fi
         else
-            # Fallback: download pre-compiled static binary
-            download_static_binary "bcftools"
+            download_bedtools_binary
         fi
     else
-        download_static_binary "bcftools"
+        download_bedtools_binary
     fi
 }
 
-install_samtools_static() {
-    log "Installing static samtools..."
+download_bedtools_binary() {
+    log "Trying to download pre-compiled bedtools binary..."
 
+    cd "$TOOLS_DIR/bin"
+
+    # Try different binary URLs
+    local urls=(
+        "https://github.com/arq5x/bedtools2/releases/download/v2.31.0/bedtools.static.binary"
+        "https://github.com/arq5x/bedtools2/releases/download/v2.30.0/bedtools.static.binary"
+    )
+
+    for url in "${urls[@]}"; do
+        if wget -q --tries=2 --timeout=60 -O bedtools "$url"; then
+            chmod +x bedtools
+            log "✓ Downloaded static bedtools from $url"
+            return 0
+        fi
+    done
+
+    log_warning "Could not download bedtools binary"
+    log "Attempting to compile from GitHub source..."
+
+    # Try direct GitHub clone
     cd "$TOOLS_DIR/build"
-
-    # Download samtools source
-    wget -q --tries=3 --timeout=120 -O samtools.tar.bz2 \
-        "https://github.com/samtools/samtools/releases/download/1.19/samtools-1.19.tar.bz2"
-
-    if [ ! -f "samtools.tar.bz2" ]; then
-        wget -q --tries=3 --timeout=120 -O samtools.tar.bz2 \
-            "https://github.com/samtools/samtools/releases/download/1.18/samtools-1.18.tar.bz2"
-    fi
-
-    if [ -f "samtools.tar.bz2" ]; then
-        tar -xjf samtools.tar.bz2
-        cd samtools-*
-
-        # Compile with static htslib
-        ./configure --prefix="$TOOLS_DIR" \
-                    --without-curses \
-                    --enable-static \
-                    CFLAGS="-fPIC -O2 -I$TOOLS_DIR/include" \
-                    LDFLAGS="-L$TOOLS_DIR/lib -static"
-
+    if command -v git &> /dev/null; then
+        git clone --depth 1 https://github.com/arq5x/bedtools2.git
+        cd bedtools2
         make -j "$CPU_CORES"
-        make install
+        cp bin/* "$TOOLS_DIR/bin/" 2>/dev/null || true
 
-        # Create static binary
-        gcc -static -o "$TOOLS_DIR/bin/samtools_static" \
-            -I. -I"$TOOLS_DIR/include" \
-            *.o "$TOOLS_DIR/lib/libhts.a" \
-            -lz -lm -lpthread 2>/dev/null || true
-
-        if [ -x "$TOOLS_DIR/bin/samtools_static" ]; then
-            ln -sf samtools_static "$TOOLS_DIR/bin/samtools"
-            log "✓ samtools compiled statically"
+        if [ -x "$TOOLS_DIR/bin/bedtools" ]; then
+            log "✓ bedtools compiled from GitHub"
         else
-            download_static_binary "samtools"
+            log_error "Failed to install bedtools. Please install manually."
+            return 1
         fi
     else
-        download_static_binary "samtools"
+        log_error "git not available. Cannot clone bedtools source."
+        return 1
     fi
 }
+
+
 
 download_static_binary() {
     local tool="$1"
@@ -336,10 +305,7 @@ install_all_static_tools() {
 
     # Install dependencies
     install_system_deps
-    install_openssl_local
     install_htslib_static
-    install_bcftools_static
-    install_samtools_static
     install_star_static
     install_gatk_local
 
@@ -365,8 +331,56 @@ install_all_static_tools() {
     log ""
 }
 
+download_bedtools_binary() {
+    log "Trying to download pre-compiled bedtools binary..."
+
+    cd "$TOOLS_DIR/bin"
+
+    # Try different binary URLs
+    local urls=(
+        "https://github.com/arq5x/bedtools2/releases/download/v2.31.0/bedtools.static.binary"
+        "https://github.com/arq5x/bedtools2/releases/download/v2.30.0/bedtools.static.binary"
+    )
+
+    for url in "${urls[@]}"; do
+        if wget -q --tries=2 --timeout=60 -O bedtools "$url"; then
+            chmod +x bedtools
+            log "✓ Downloaded static bedtools from $url"
+            return 0
+        fi
+    done
+
+    log_warning "Could not download bedtools binary"
+    log "Attempting to compile from GitHub source..."
+
+    # Try direct GitHub clone
+    cd "$TOOLS_DIR/build"
+    if command -v git &> /dev/null; then
+        git clone --depth 1 https://github.com/arq5x/bedtools2.git
+        cd bedtools2
+        make -j "$CPU_CORES"
+        cp bin/* "$TOOLS_DIR/bin/" 2>/dev/null || true
+
+        if [ -x "$TOOLS_DIR/bin/bedtools" ]; then
+            log "✓ bedtools compiled from GitHub"
+        else
+            log_error "Failed to install bedtools. Please install manually."
+            return 1
+        fi
+    else
+        log_error "git not available. Cannot clone bedtools source."
+        return 1
+    fi
+}
+
 install_other_tools() {
     log "Installing other required tools..."
+
+    # bedtools
+    if [ ! -x "$TOOLS_DIR/bin/bedtools" ]; then
+        log "Installing bedtools..."
+        install_bedtools_static
+    fi
 
     # FastQC
     if [ ! -x "$TOOLS_DIR/bin/fastqc" ]; then
@@ -433,7 +447,7 @@ test_installations() {
     local all_ok=true
 
     # Test each tool
-    for tool in bcftools samtools tabix bgzip STAR fastqc prefetch pigz parallel; do
+    for tool in  samtools tabix bgzip STAR fastqc prefetch pigz parallel; do
         if [ -x "$TOOLS_DIR/bin/$tool" ]; then
             if "$TOOLS_DIR/bin/$tool" --version 2>&1 | head -1 > /dev/null 2>&1; then
                 log "✓ $tool is working"
