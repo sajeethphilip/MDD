@@ -324,9 +324,12 @@ setup_environment() {
     add_to_path "${TOOLS_DIR}/sratoolkit/bin"
     add_to_path "${TOOLS_DIR}/STAR-2.7.11a/bin/Linux_x86_64_static"
 
-    if [ -d "${TOOLS_DIR}/lib/python"*"/site-packages" ]; then
-        PYTHON_SITE_DIR=$(find "${TOOLS_DIR}/lib" -name "site-packages" -type d | head -1)
-        if [ -n "${PYTHON_SITE_DIR}" ]; then
+    # Fix Python site-packages handling - more robust
+    if [ -d "${TOOLS_DIR}/lib" ]; then
+        PYTHON_SITE_DIR=$(find "${TOOLS_DIR}/lib" -name "site-packages" -type d 2>/dev/null | head -1)
+        if [ -n "${PYTHON_SITE_DIR}" ] && [ -d "${PYTHON_SITE_DIR}" ]; then
+            # Clean up the path to avoid spaces issues
+            PYTHON_SITE_DIR=$(echo "${PYTHON_SITE_DIR}" | tr -d '\n' | tr -d '\r')
             export PYTHONPATH="${PYTHON_SITE_DIR}:${PYTHONPATH:-}"
             log "Added ${PYTHON_SITE_DIR} to PYTHONPATH"
         fi
@@ -334,6 +337,7 @@ setup_environment() {
 
     USER_SITE=$(python3 -m site --user-site 2>/dev/null || python -m site --user-site 2>/dev/null || echo "")
     if [ -n "${USER_SITE}" ] && [ -d "${USER_SITE}" ]; then
+        USER_SITE=$(echo "${USER_SITE}" | tr -d '\n' | tr -d '\r')
         export PYTHONPATH="${USER_SITE}:${PYTHONPATH:-}"
         log "Added ${USER_SITE} to PYTHONPATH"
     fi
@@ -370,16 +374,22 @@ fi
 if [ -f "$HOME/.local/mdd2_tools/Trimmomatic-0.39/trimmomatic-0.39.jar" ]; then
     export TRIMMOMATIC_JAR="$HOME/.local/mdd2_tools/Trimmomatic-0.39/trimmomatic-0.39.jar"
 fi
-if [ -d "$HOME/.local/mdd2_tools/lib/python"*"/site-packages" ]; then
-    PYTHON_SITE_DIR=$(find "$HOME/.local/mdd2_tools/lib" -name "site-packages" -type d | head -1)
-    if [ -n "${PYTHON_SITE_DIR}" ]; then
-        export PYTHONPATH="${PYTHON_SITE_DIR}:${PYTHONPATH:-}"
+
+# Python path setup - simplified to avoid errors
+if [ -d "$HOME/.local/mdd2_tools/lib" ]; then
+    PYTHON_SITE_DIR=$(find "$HOME/.local/mdd2_tools/lib" -name "site-packages" -type d 2>/dev/null | head -1)
+    if [ -n "$PYTHON_SITE_DIR" ] && [ -d "$PYTHON_SITE_DIR" ]; then
+        PYTHON_SITE_DIR=$(echo "$PYTHON_SITE_DIR" | tr -d '\n' | tr -d '\r')
+        export PYTHONPATH="$PYTHON_SITE_DIR:${PYTHONPATH:-}"
     fi
 fi
-USER_SITE=$(python3 -m site --user-site 2>/dev/null || python -m site --user-site 2>/dev/null)
-if [ -n "${USER_SITE}" ] && [ -d "${USER_SITE}" ]; then
-    export PYTHONPATH="${USER_SITE}:${PYTHONPATH:-}"
+
+USER_SITE=$(python3 -m site --user-site 2>/dev/null || python -m site --user-site 2>/dev/null || echo "")
+if [ -n "$USER_SITE" ] && [ -d "$USER_SITE" ]; then
+    USER_SITE=$(echo "$USER_SITE" | tr -d '\n' | tr -d '\r')
+    export PYTHONPATH="$USER_SITE:${PYTHONPATH:-}"
 fi
+
 export CPU_CORES=$(nproc 2>/dev/null || echo 8)
 export MAX_PARALLEL=4
 export GATK_THREADS=8
