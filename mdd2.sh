@@ -14,6 +14,17 @@ set -o pipefail
 # Configuration Section
 ############################################################
 
+# RNA-seq variant calling method
+# Options: "evidence" (coverage-based with Mutect2) or "traditional" (HaplotypeCaller)
+
+RNA_CALLING_METHOD="evidence"  # Default to evidence-based
+
+# Evidence-based method parameters
+MIN_COVERAGE=10                # Minimum coverage for variant calling (≥10x)
+MIN_BASE_QUALITY=20            # Minimum base quality score (new parameter)
+MIN_MAPQ=20                    # Minimum mapping quality
+MUTECT2_AF_THRESHOLD=0.01              # Minimum allele fraction for Mutect
+
 KEEP_INTERMEDIATE=false
 PIPELINE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BASE_DIR="${PIPELINE_DIR}/analysis"
@@ -2392,24 +2403,103 @@ process_sample_DNA() {
     fi
 
     ##################################
-    # 5. Variant Calling
+    # 5. RNA-seq Variant Calling with Choice of Methods
     ##################################
     RAW_VCF="${VCF_DIR}/${SAMPLE}.vcf.gz"
 
     if [ -f "${RAW_VCF}" ]; then
         log "Variants already called: ${RAW_VCF}"
     else
-        log "Calling variants with HaplotypeCaller..."
-        $GATK HaplotypeCaller \
-            -R "${REF_GENOME}" \
-            -I "${RECAL_BAM}" \
-            -O "${RAW_VCF}" \
-            --dont-use-soft-clipped-bases \
-            --standard-min-confidence-threshold-for-calling 20.0
+        log "Calling RNA-seq variants..."
+
+        case "${RNA_CALLING_METHOD}" in
+            "evidence")
+                log "Using EVIDENCE-BASED method: Coverage filtering + Mutect2"
+
+                # Step 1: Create coverage BED file (≥10x coverage regions)
+                COVERAGE_BED="${BAM_DIR}/${SAMPLE}.coverage_${MIN_COVERAGE}x.bed"
+
+                if [ ! -f "${COVERAGE_BED}" ]; then
+                    log "Creating coverage BED file (regions with ≥${MIN_COVERAGE}x coverage)..."
+
+                    # Generate gene BED if needed
+                    GENE_BED="${BASE_DIR}/references/annotations/genes.bed"
+                    if [ ! -f "${GENE_BED}" ] && [ -f "${GENE_BED}.gz" ]; then
+                        gunzip -c "${GENE_BED}.gz" > "${GENE_BED}"
+                    fi
+
+                    # Calculate coverage and filter
+                    samtools depth -a "${INPUT_FOR_VARIANTS}" | \
+                        awk -v min_cov="${MIN_COVERAGE}" '$3 >= min_cov {print $1 "\t" $2-1 "\t" $2}' | \
+                        sort -k1,1 -k2,2n | \
+                        bedtools merge -i - > "${COVERAGE_BED}" 2>"${BAM_DIR}/${SAMPLE}.coverage.log"
+
+                    COVERAGE_REGIONS=$(wc -l < "${COVERAGE_BED}")
+                    log "Found ${COVERAGE_REGIONS} genomic regions with ≥${MIN_COVERAGE}x coverage"
+
+                    if [ "${COVERAGE_REGIONS}" -eq 0 ]; then
+                        log_warning "No regions meet coverage threshold! Falling back to traditional method"
+                        RNA_CALLING_METHOD="traditional"
+                    fi
+                else
+                    log "Using existing coverage BED file: ${COVERAGE_BED}"
+                fi
+
+                # Step 2: Call variants with Mutect2 on covered regions
+                if [ "${RNA_CALLING_METHOD}" = "evidence" ]; then
+                    log "Calling variants with Mutect2 on covered regions..."
+
+                    $GATK Mutect2 \
+                        -R "${REF_GENOME}" \
+                        -I "${INPUT_FOR_VARIANTS}" \
+                        -O "${RAW_VCF}" \
+                        -L "${COVERAGE_BED}" \
+                        --dont-use-soft-clipped-bases true \
+                        --minimum-mapping-quality ${MIN_MAPQ} \
+                        --minimum-base-quality ${MIN_BASE_QUALITY} \
+                        --native-pair-hmm-threads ${GATK_THREADS} \
+                        --max-reads-per-alignment-start 100 \
+                        --downsampling-stride 20 \
+                        --max-suspicious-reads-per-alignment-start 6
+                fi
+                ;;
+
+            "traditional")
+                log "Using TRADITIONAL method: HaplotypeCaller with RNA-seq settings"
+
+                $GATK HaplotypeCaller \
+                    -R "${REF_GENOME}" \
+                    -I "${INPUT_FOR_VARIANTS}" \
+                    -O "${RAW_VCF}" \
+                    --dont-use-soft-clipped-bases true \
+                    --standard-min-confidence-threshold-for-calling 20.0 \
+                    --minimum-base-quality ${MIN_BASE_QUALITY} \
+                    --minimum-mapping-quality ${MIN_MAPQ} \
+                    --max-reads-per-alignment-start 50 \
+                    --max-assembly-region-size 500 \
+                    --pair-hmm-implementation LOGLESS_CACHING \
+                    --annotation-group StandardAnnotation \
+                    --annotation-group StandardHCAnnotation \
+                    --annotation-group AS_StandardAnnotation
+                ;;
+
+            *)
+                log_error "Unknown RNA_CALLING_METHOD: ${RNA_CALLING_METHOD}. Use 'evidence' or 'traditional'"
+                ;;
+        esac
+
+        # Check if variant calling succeeded
+        if [ ! -f "${RAW_VCF}" ] || [ ! -s "${RAW_VCF}" ]; then
+            log_error "Variant calling failed to produce output VCF"
+        fi
+
+        # Count variants
+        VAR_COUNT=$(bcftools view -H "${RAW_VCF}" 2>/dev/null | wc -l)
+        log "Successfully called ${VAR_COUNT} variants using ${RNA_CALLING_METHOD} method"
     fi
 
     ##################################
-    # 6. Variant Filtration
+    # 6. Variant Filtration (Updated for both methods)
     ##################################
     FILTERED_VCF="${VCF_DIR}/${SAMPLE}.filtered.vcf.gz"
 
@@ -2417,17 +2507,32 @@ process_sample_DNA() {
         log "Variants already filtered: ${FILTERED_VCF}"
     else
         log "Filtering variants..."
-        $GATK VariantFiltration \
-            -R "${REF_GENOME}" \
-            -V "${RAW_VCF}" \
-            --filter-expression "QD < 2.0" --filter-name "LowQD" \
-            --filter-expression "FS > 30.0" --filter-name "FS" \
-            --filter-expression "SOR > 3.0" --filter-name "SOR" \
-            --filter-expression "MQ < 40.0" --filter-name "LowMQ" \
-            --filter-expression "MQRankSum < -12.5" --filter-name "MQRankSum" \
-            --filter-expression "ReadPosRankSum < -8.0" --filter-name "ReadPosRankSum" \
-            --window 35 --cluster 3 \
-            -O "${FILTERED_VCF}"
+
+        # Different filters based on calling method
+        if [ "${RNA_CALLING_METHOD}" = "evidence" ]; then
+            # Mutect2-specific filters (more stringent for potential somatic variants)
+            $GATK FilterMutectCalls \
+                -R "${REF_GENOME}" \
+                -V "${RAW_VCF}" \
+                -O "${FILTERED_VCF}" \
+                --min-allele-fraction 0.01 \
+                --max-alt-allele-count 2 \
+                --unique-alt-read-count 2
+        else
+            # HaplotypeCaller filters (standard germline filters)
+            $GATK VariantFiltration \
+                -R "${REF_GENOME}" \
+                -V "${RAW_VCF}" \
+                --filter-expression "QD < 2.0" --filter-name "LowQD" \
+                --filter-expression "FS > 30.0" --filter-name "FS" \
+                --filter-expression "SOR > 3.0" --filter-name "SOR" \
+                --filter-expression "MQ < 40.0" --filter-name "LowMQ" \
+                --filter-expression "MQRankSum < -12.5" --filter-name "MQRankSum" \
+                --filter-expression "ReadPosRankSum < -8.0" --filter-name "ReadPosRankSum" \
+                --filter-expression "QUAL < 30.0" --filter-name "LowQual" \
+                --window 35 --cluster 3 \
+                -O "${FILTERED_VCF}"
+        fi
     fi
 
     ##################################
