@@ -139,7 +139,7 @@ graph TD
     AddGenes --> Export[Export to TSV]
     Export --> EndDNA[End: DNA Variants]
 ```
-# RNA-seq Variant Calling Flow (Evidence-Based)
+# RNA-seq Variant Calling Flow Evidence-Based
 ```mermaid
 graph TD
     StartRNA[Input: RNA-seq BAM] --> AddRG_RNA[Add Read Groups]
@@ -175,40 +175,6 @@ graph TD
     ExportRNA --> EndRNA[End: RNA Variants]
 ```
 
-```mermaid
-graph TD
-    StartRNA[Input: RNA-seq BAM] --> AddRG_RNA[Add Read Groups]
-    
-    AddRG_RNA --> MarkDup_RNA[Mark Duplicates]
-    MarkDup_RNA --> SplitNCigar_RNA[Split N Cigar Reads<br/>RNA-specific]
-    
-    SplitNCigar_RNA --> BQSR_Opt{BQSR for RNA?}
-    
-    BQSR_Opt -->|Yes| BQSR_RNA[Base Quality Recalibration]
-    BQSR_Opt -->|No| SkipBQSR[Skip BQSR]
-    
-    BQSR_RNA --> CallVariants_RNA
-    SkipBQSR --> CallVariants_RNA
-    
-    CallVariants_RNA --> Method{RNA Variant Calling Method}
-    
-    Method -->|Evidence-Based| CoverageBed[Create Coverage BED<br/>(≥10x coverage)]
-    CoverageBed --> Mutect2[Mutect2 on Covered Regions]
-    
-    Method -->|Traditional| HaplotypeCaller_RNA[HaplotypeCaller<br/>RNA settings]
-    
-    Mutect2 --> Filter_RNA[Filter RNA Variants]
-    HaplotypeCaller_RNA --> Filter_RNA
-    
-    Filter_RNA --> ExtractPASS[Extract PASS Variants]
-    ExtractPASS --> AnnotateRNA[SnpEff Annotation<br/>(RNA-aware)]
-    
-    AnnotateRNA --> AddRSID_RNA[Add dbSNP IDs]
-    AddRSID_RNA --> AddGenes_RNA[Add Gene Info]
-    AddGenes_RNA --> ExportRNA[Export RNA Variants to TSV]
-    
-    ExportRNA --> EndRNA[End: RNA Variants]
-```
 
 # Quality Control & Reporting Flow
 
