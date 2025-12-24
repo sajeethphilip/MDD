@@ -27,9 +27,16 @@ MUTECT2_AF_THRESHOLD=0.01              # Minimum allele fraction for Mutect
 
 KEEP_INTERMEDIATE=false
 PIPELINE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-BASE_DIR="${PIPELINE_DIR}/analysis"
+BASE_DIR="${PIPELINE_DIR}/analysis2"
 TOOLS_DIR="${HOME}/.local/mdd2_tools"
 SCRIPT_DIR="${PIPELINE_DIR}/scripts"
+
+# Parallel processing configuration
+#HAPLOTYPE_CALLER_MODE="serial"  # Options: "serial", "parallel"
+HAPLOTYPE_CALLER_MODE="parallel"  # Change from "serial" to "parallel"
+INTERVAL_FILE="${BASE_DIR}/references/genome/intervals.list"
+INTERVAL_COUNT=50  # Number of intervals for parallel processing
+PARALLEL_JOBS=32    # Number of parallel jobs to run
 
 mkdir -p "${BASE_DIR}" "${SCRIPT_DIR}" "${TOOLS_DIR}" "${TOOLS_DIR}/bin"
 mkdir -p "${BASE_DIR}/"{data,references,tools,logs}
@@ -195,6 +202,31 @@ log_warning() {
 ############################################################
 # Utility Functions (Complete from original)
 ############################################################
+
+generate_intervals() {
+    log "Generating intervals for parallel processing..."
+
+    if [ ! -f "${REF_GENOME}.fai" ]; then
+        samtools faidx "${REF_GENOME}"
+    fi
+
+    # Create uniform intervals (e.g., 10MB each)
+    INTERVAL_SIZE=10000000  # 10MB
+
+    # Generate intervals
+    cat "${REF_GENOME}.fai" | awk -v size="${INTERVAL_SIZE}" '{
+        chrom = $1;
+        length = $2;
+        for (start = 1; start <= length; start += size) {
+            end = start + size - 1;
+            if (end > length) end = length;
+            printf "%s:%d-%d\n", chrom, start, end;
+        }
+    }' > "${INTERVAL_FILE}"
+
+    TOTAL_INTERVALS=$(wc -l < "${INTERVAL_FILE}")
+    log "Generated ${TOTAL_INTERVALS} intervals for parallel processing"
+}
 
 check_tool() {
     local tool="$1"
@@ -1150,110 +1182,194 @@ setup_references() {
 extract_sra_ids_from_excel() {
     local excel_file="$1"
     local output_file="$2"
+    local project_file="$3"  # New parameter
 
-    cat > "${SCRIPT_DIR}/extract_sra_ids.py" << 'PYTHONSCRIPT'
+    # Use a unique name to avoid overwriting other scripts
+    local PYTHON_SCRIPT="${SCRIPT_DIR}/extract_sra_ids_interactive.py"
+
+    cat > "${PYTHON_SCRIPT}" << 'PYTHONSCRIPT'
 #!/usr/bin/env python3
 import pandas as pd
 import sys
 import re
 
-def extract_sra_ids(excel_path, output_path):
+def extract_sra_ids(excel_path, output_path, project_output_path):
+    """Main function to extract SRA IDs with interactive column selection"""
+
+    def interactive_column_selection(df, purpose):
+        """Helper: Interactive column selection with enumerated options"""
+        print(f"\n=== Select column for {purpose} ===")
+        print("Available columns:")
+
+        for i, col in enumerate(df.columns, 1):
+            # Show first non-null value as preview
+            preview = df[col].dropna().iloc[0] if not df[col].dropna().empty else '[Empty]'
+            print(f"  {i}. {col} (example: '{preview}')")
+
+        while True:
+            try:
+                choice = input(f"Select column number for {purpose} (1-{len(df.columns)}): ").strip()
+                if not choice.isdigit():
+                    print("Please enter a number")
+                    continue
+
+                idx = int(choice) - 1
+                if 0 <= idx < len(df.columns):
+                    selected = df.columns[idx]
+                    print(f"✓ Selected '{selected}' for {purpose}")
+                    return selected
+                else:
+                    print(f"Please enter a number between 1 and {len(df.columns)}")
+            except KeyboardInterrupt:
+                print("\nOperation cancelled")
+                sys.exit(1)
+            except Exception as e:
+                print(f"Error: {e}")
+
     try:
-        # Try to read specific sheet names first
-        try:
-            mdd_df = pd.read_excel(excel_path, sheet_name='Female MDD')
-            ctrl_df = pd.read_excel(excel_path, sheet_name='Female Control')
-        except:
-            # Try to find sheets with different names
-            xls = pd.ExcelFile(excel_path)
-            sheet_names = xls.sheet_names
-            print(f"Available sheets: {sheet_names}")
+        # 1. Read Excel file
+        print(f"📂 Reading Excel file: {excel_path}")
 
-            # Use first two sheets
-            mdd_df = pd.read_excel(excel_path, sheet_name=sheet_names[0])
-            ctrl_df = pd.read_excel(excel_path, sheet_name=sheet_names[1]) if len(sheet_names) > 1 else pd.DataFrame()
+        # Try to get sheet names
+        xls = pd.ExcelFile(excel_path)
+        if len(xls.sheet_names) > 1:
+            print(f"\nMultiple sheets found:")
+            for i, sheet in enumerate(xls.sheet_names, 1):
+                print(f"  {i}. {sheet}")
 
-        def find_sra_column(df):
-            sra_pattern = re.compile(r'^SRR\d+$')
-            # Try common column names first
-            for col_name in df.columns:
-                col_lower = str(col_name).lower()
-                if any(keyword in col_lower for keyword in ['sample', 'id', 'sra', 'accession']):
-                    if df[col_name].dropna().astype(str).str.match(sra_pattern).any():
-                        return col_name
-
-            # Try all columns
-            for col_name in df.columns:
-                if df[col_name].dropna().astype(str).str.match(sra_pattern).any():
-                    return col_name
-
-            return None
-
-        all_sra_ids = []
-
-        for df, sheet_name in [(mdd_df, 'MDD'), (ctrl_df, 'Control')]:
-            if df.empty:
-                continue
-
-            sra_col = find_sra_column(df)
-            if sra_col:
-                sra_ids = df[sra_col].dropna().astype(str)
-                valid_ids = sra_ids[sra_ids.str.match(r'^SRR\d+$')].unique()
-                all_sra_ids.extend(valid_ids)
-                print(f"Found {len(valid_ids)} SRA IDs in {sheet_name} sheet (column: '{sra_col}')")
+            sheet_choice = input(f"Select sheet number (1-{len(xls.sheet_names)}), default [1]: ").strip()
+            if sheet_choice and sheet_choice.isdigit():
+                sheet_idx = int(sheet_choice) - 1
+                if 0 <= sheet_idx < len(xls.sheet_names):
+                    df = pd.read_excel(excel_path, sheet_name=xls.sheet_names[sheet_idx])
+                else:
+                    df = pd.read_excel(excel_path, sheet_name=0)
             else:
-                print(f"Warning: Could not find SRA IDs in {sheet_name} sheet")
+                df = pd.read_excel(excel_path, sheet_name=0)
+        else:
+            df = pd.read_excel(excel_path, sheet_name=0)
 
-        # Remove duplicates and sort
-        unique_ids = sorted(set(all_sra_ids))
+        print(f"✓ Successfully loaded Excel file")
+        print(f"  Shape: {df.shape[0]} rows × {df.shape[1]} columns")
 
-        if not unique_ids:
-            print("ERROR: No SRA IDs found in Excel file")
+        # 2. Interactive column selection
+        print("\n" + "="*50)
+        sra_col = interactive_column_selection(df, "SRA IDs")
+        print("-"*50)
+        project_col = interactive_column_selection(df, "Project IDs (MDD/Control)")
+        print("="*50)
+
+        # 3. Extract SRA IDs (handle various formats)
+        sra_column_data = df[sra_col].dropna().astype(str)
+        valid_sra_pairs = []  # List of (sra_id, project_id)
+
+        print(f"\n🔍 Scanning column '{sra_col}' for SRA IDs...")
+
+        for idx, sra_cell in enumerate(sra_column_data):
+            # Try to find SRR followed by digits in the cell
+            matches = re.findall(r'(SRR\d+)', sra_cell)
+
+            if matches:
+                # Found SRA ID(s) in this cell
+                project_cell = df.iloc[idx][project_col] if project_col in df.columns else "UNKNOWN"
+                project_val = str(project_cell) if pd.notna(project_cell) else "UNKNOWN"
+
+                for sra_match in matches:
+                    valid_sra_pairs.append((sra_match, project_val))
+            elif re.match(r'^SRR\d+$', sra_cell.strip()):
+                # Cell contains just an SRA ID
+                project_cell = df.iloc[idx][project_col] if project_col in df.columns else "UNKNOWN"
+                project_val = str(project_cell) if pd.notna(project_cell) else "UNKNOWN"
+                valid_sra_pairs.append((sra_cell.strip(), project_val))
+
+        # 4. Remove duplicates while preserving order
+        unique_pairs = []
+        seen = set()
+        for sra, project in valid_sra_pairs:
+            if sra not in seen:
+                seen.add(sra)
+                unique_pairs.append((sra, project))
+
+        if not unique_pairs:
+            print("❌ ERROR: No SRA IDs found in the selected column!")
+            print(f"   Check that column '{sra_col}' contains IDs like SRR12345678")
             return False
 
-        # Write to file
+        # 5. Write output files
         with open(output_path, 'w') as f:
-            for sra_id in unique_ids:
+            for sra_id, _ in unique_pairs:
                 f.write(f"{sra_id}\n")
 
-        print(f"\nTotal unique SRA IDs extracted: {len(unique_ids)}")
-        print(f"First 5 IDs: {unique_ids[:5]}")
-        if len(unique_ids) > 5:
-            print(f"... and {len(unique_ids) - 5} more")
+        with open(project_output_path, 'w') as f:
+            for sra_id, project_id in unique_pairs:
+                f.write(f"{sra_id}\t{project_id}\n")
+
+        # 6. Display summary
+        print(f"\n✅ SUCCESS: Extracted {len(unique_pairs)} unique SRA IDs")
+        print(f"   SRA list: {output_path}")
+        print(f"   Project mapping: {project_output_path}")
+
+        # Show project distribution
+        from collections import Counter
+        project_counts = Counter([p for _, p in unique_pairs])
+        print(f"\n📊 Project distribution:")
+        for project, count in sorted(project_counts.items()):
+            print(f"   {project}: {count} samples")
+
+        # Show first few samples
+        print(f"\n🔬 First 5 samples:")
+        for i, (sra, project) in enumerate(unique_pairs[:5]):
+            print(f"   {i+1}. {sra} → {project}")
+        if len(unique_pairs) > 5:
+            print(f"   ... and {len(unique_pairs) - 5} more")
 
         return True
 
+    except FileNotFoundError:
+        print(f"❌ ERROR: File not found: {excel_path}")
+        return False
     except Exception as e:
-        print(f"Error extracting SRA IDs: {e}")
+        print(f"❌ ERROR: {e}")
+        import traceback
+        traceback.print_exc()
         return False
 
+# Main execution
 if __name__ == "__main__":
-    if len(sys.argv) != 3:
-        print("Usage: python extract_sra_ids.py <excel_file> <output_file>")
+    if len(sys.argv) != 4:
+        print("Usage: python extract_sra_ids.py <excel_file> <sra_output_file> <project_output_file>")
+        print("Example: python extract_sra_ids.py samples.xlsx sra_ids.txt project_map.txt")
         sys.exit(1)
 
-    success = extract_sra_ids(sys.argv[1], sys.argv[2])
+    excel_file = sys.argv[1]
+    sra_output = sys.argv[2]
+    project_output = sys.argv[3]
+
+    success = extract_sra_ids(excel_file, sra_output, project_output)
     sys.exit(0 if success else 1)
 PYTHONSCRIPT
 
-    chmod +x "${SCRIPT_DIR}/extract_sra_ids.py"
+    chmod +x "${PYTHON_SCRIPT}"
 
     # Check for Python dependencies
     if ! python3 -c "import pandas" &> /dev/null; then
         log "Installing Python dependencies..."
         if command -v pip3 &> /dev/null; then
-            pip3 install pandas openpyxl
+            pip3 install --user pandas openpyxl 2>/dev/null || pip3 install pandas openpyxl
         elif command -v pip &> /dev/null; then
-            pip install pandas openpyxl
+            pip install --user pandas openpyxl 2>/dev/null || pip install pandas openpyxl
         else
             log_error "pip not available. Please install pandas manually: pip install pandas openpyxl"
+            return 1
         fi
     fi
 
-    log "Extracting SRA IDs from Excel..."
-    if python3 "${SCRIPT_DIR}/extract_sra_ids.py" "${excel_file}" "${output_file}"; then
+    log "Extracting SRA IDs from Excel (interactive mode)..."
+    if python3 "${PYTHON_SCRIPT}" "${excel_file}" "${output_file}" "${project_file}"; then
+        log "Interactive SRA ID extraction completed successfully"
         return 0
     else
+        log_error "Interactive SRA ID extraction failed"
         return 1
     fi
 }
@@ -1298,32 +1414,138 @@ prompt_for_excel_file() {
 
 load_sra_ids() {
     log "Loading SRA IDs..."
-    prompt_for_excel_file
 
-    if extract_sra_ids_from_excel "${EXCEL_FILE}" "${SRA_LIST_FILE}"; then
-        if [ -f "${SRA_LIST_FILE}" ]; then
+    # Use existing EXCEL_FILE or prompt (keep your existing prompt_for_excel_file)
+    if [ -z "${EXCEL_FILE}" ] || [ ! -f "${EXCEL_FILE}" ]; then
+        prompt_for_excel_file
+    fi
+
+    log "Using Excel file: ${EXCEL_FILE}"
+
+    # Define output files - IMPORTANT: Ensure BASE_DIR is defined
+    SRA_LIST_FILE="${BASE_DIR}/sra_ids.txt"
+    PROJECT_MAP_FILE="${BASE_DIR}/project_mapping.txt"
+
+    # Call the UPDATED interactive extractor (with 3 parameters)
+    if extract_sra_ids_from_excel "${EXCEL_FILE}" "${SRA_LIST_FILE}" "${PROJECT_MAP_FILE}"; then
+        if [ -f "${SRA_LIST_FILE}" ] && [ -s "${SRA_LIST_FILE}" ]; then
             count=$(wc -l < "${SRA_LIST_FILE}" | tr -d ' ')
             [ "${count}" -eq 0 ] && log_error "No SRA IDs found in Excel file"
 
+            # Load SRA IDs into array
             mapfile -t SRA_LIST < "${SRA_LIST_FILE}"
-            log "Loaded ${#SRA_LIST[@]} SRA IDs from ${EXCEL_FILE}"
+
+            # --- Load Project IDs into Associative Array ---
+            declare -gA PROJECT_MAP  # Make it globally available
+            PROJECTS_LOADED=0
+
+            if [ -f "${PROJECT_MAP_FILE}" ] && [ -s "${PROJECT_MAP_FILE}" ]; then
+                # Clear any existing mappings
+                unset PROJECT_MAP
+                declare -gA PROJECT_MAP
+
+                while IFS=$'\t' read -r sra_id project_id; do
+                    # Clean up any whitespace or quotes
+                    sra_id_clean=$(echo "${sra_id}" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//;s/^"//;s/"$//')
+                    project_id_clean=$(echo "${project_id}" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//;s/^"//;s/"$//')
+
+                    if [[ "${sra_id_clean}" =~ ^SRR[0-9]+$ ]]; then
+                        PROJECT_MAP["${sra_id_clean}"]="${project_id_clean}"
+                        PROJECTS_LOADED=$((PROJECTS_LOADED + 1))
+                    else
+                        log_warning "Skipping invalid SRA ID in mapping: '${sra_id_clean}'"
+                    fi
+                done < "${PROJECT_MAP_FILE}"
+
+                log "Loaded ${#SRA_LIST[@]} SRA IDs with ${PROJECTS_LOADED} Project mappings from ${EXCEL_FILE}"
+            else
+                log_warning "Project mapping file not found or empty at: ${PROJECT_MAP_FILE}"
+                log "All samples will be marked as 'UNKNOWN'."
+
+                # Initialize all samples as UNKNOWN
+                for sra_id in "${SRA_LIST[@]}"; do
+                    sra_clean=$(echo "${sra_id}" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+                    if [[ "${sra_clean}" =~ ^SRR[0-9]+$ ]]; then
+                        PROJECT_MAP["${sra_clean}"]="UNKNOWN"
+                    fi
+                done
+            fi
+            # --- END Project ID loading ---
+
+            # Verify all SRA IDs have mappings
+            MISSING_MAPPINGS=0
+            for sra_id in "${SRA_LIST[@]}"; do
+                sra_clean=$(echo "${sra_id}" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+                if [ -z "${PROJECT_MAP["${sra_clean}"]+x}" ]; then
+                    log_warning "No project mapping for SRA ID: ${sra_clean}"
+                    PROJECT_MAP["${sra_clean}"]="UNKNOWN"
+                    MISSING_MAPPINGS=$((MISSING_MAPPINGS + 1))
+                fi
+            done
+
+            if [ "${MISSING_MAPPINGS}" -gt 0 ]; then
+                log_warning "${MISSING_MAPPINGS} SRA IDs had no project mapping and were set to 'UNKNOWN'"
+            fi
+
+            # Display summary
+            echo ""
+            echo "========================================"
+            echo "SRA ID Loading Summary"
+            echo "========================================"
+            echo "Total SRA IDs loaded: ${#SRA_LIST[@]}"
+            echo "Project mappings loaded: ${PROJECTS_LOADED}"
+
+            # Show project distribution
+            declare -A PROJECT_COUNTS=()  # Initialize as empty associative array
+            for sra_id in "${SRA_LIST[@]}"; do
+                sra_clean=$(echo "${sra_id}" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+                project="${PROJECT_MAP["${sra_clean}"]}"
+                if [ -n "${project}" ]; then
+                    PROJECT_COUNTS["${project}"]=$((PROJECT_COUNTS["${project}"] + 1))
+                fi
+            done
 
             echo ""
-            echo "First 5 SRA IDs:"
-            for i in {0..4}; do
-                [ -n "${SRA_LIST[$i]}" ] && echo "  ${SRA_LIST[$i]}"
+            echo "Project distribution:"
+            for project in "${!PROJECT_COUNTS[@]}"; do
+                echo "  ${project}: ${PROJECT_COUNTS["${project}"]} samples"
             done
+
+            # Display first 5 SRA IDs with their Project ID
+            echo ""
+            echo "First 5 SRA IDs with Project IDs:"
+            for i in {0..4}; do
+                if [ -n "${SRA_LIST[$i]}" ]; then
+                    sra_clean=$(echo "${SRA_LIST[$i]}" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+                    echo "  ${sra_clean} -> ${PROJECT_MAP["${sra_clean}"]:-NOT_FOUND}"
+                fi
+            done
+
             if [ ${#SRA_LIST[@]} -gt 5 ]; then
                 echo "  ... and $(( ${#SRA_LIST[@]} - 5 )) more"
             fi
             echo ""
+
         else
-            log_error "Failed to create SRA IDs file"
+            log_error "SRA IDs file is empty or not created: ${SRA_LIST_FILE}"
+            log "Check that:"
+            log "  1. The Excel file contains valid SRA IDs (SRRXXXXXXXX)"
+            log "  2. You selected the correct column during interactive selection"
+            log "  3. Python dependencies (pandas, openpyxl) are installed"
+            return 1
         fi
     else
-        log_error "Failed to extract SRA IDs from Excel file"
+        log_error "Failed to extract SRA IDs from Excel file: ${EXCEL_FILE}"
+        log "Possible issues:"
+        log "  1. File format not supported (need .xlsx or .xls)"
+        log "  2. File is corrupted or password protected"
+        log "  3. No valid SRA IDs found in selected column"
+        return 1
     fi
+
+    return 0
 }
+
 #=================================================================
 # For single SRA files
 #=================================================================
@@ -1737,9 +1959,24 @@ process_sample_sequentially() {
         log "Step 8: Cleaning up intermediate files..."
         cleanup_intermediate "${SRR}" "${KEEP_INTERMEDIATE}"
     fi
-
+    cleanup_interval_files "${SRR}"
     log "✓ Successfully processed ${SRR}"
     return 0
+}
+
+cleanup_interval_files() {
+    local SAMPLE="$1"
+
+    if [ "${KEEP_INTERMEDIATE}" = "true" ]; then
+        log "Keeping interval files (--keep-intermediate flag set)"
+        return 0
+    fi
+
+    INTERVAL_DIR="${BASE_DIR}/data/vcf/${SAMPLE}/intervals"
+    if [ -d "${INTERVAL_DIR}" ]; then
+        log "Cleaning up interval files..."
+        rm -rf "${INTERVAL_DIR}"
+    fi
 }
 
 run_fastqc_single() {
@@ -3038,19 +3275,86 @@ process_sample() {
     if [ -f "${RAW_VCF}" ]; then
         log "Variants already called: ${RAW_VCF}"
     else
-        log "Calling RNA-seq variants with HaplotypeCaller..."
-        $GATK HaplotypeCaller \
-            -R "${REF_GENOME}" \
-            -I "${INPUT_FOR_VARIANTS}" \
-            -O "${RAW_VCF}" \
-            --dont-use-soft-clipped-bases true \
-            --standard-min-confidence-threshold-for-calling 20.0 \
-            --min-base-quality-score 10 \
-            --annotation-group StandardAnnotation \
-            --annotation-group StandardHCAnnotation \
-            --max-reads-per-alignment-start 50 \
-            --max-assembly-region-size 500 \
-            --pair-hmm-implementation LOGLESS_CACHING
+        log "Calling RNA-seq variants..."
+
+        # ====== NEW: Determine sample group from Project ID ======
+        SAMPLE_GROUP="UNKNOWN"
+        if [ -v "PROJECT_MAP[$SAMPLE]" ]; then
+            SAMPLE_GROUP="${PROJECT_MAP[$SAMPLE]}"
+            log "Sample ${SAMPLE} classified as: ${SAMPLE_GROUP}"
+        else
+            log_warning "No project mapping for ${SAMPLE}, using default"
+        fi
+        # ====== END NEW ======
+
+        # ====== MODIFIED: Choose calling method with group tagging ======
+        case "${RNA_CALLING_METHOD}" in
+            "evidence")
+                log "Using EVIDENCE-BASED method: Coverage filtering + Mutect2"
+                log "Sample group tag: ${SAMPLE_GROUP}"
+
+                # Coverage BED file should already exist from earlier steps
+                COVERAGE_BED="${BAM_DIR}/${SAMPLE}.coverage_${MIN_COVERAGE}x.bed"
+
+                if [ ! -f "${COVERAGE_BED}" ] || [ ! -s "${COVERAGE_BED}" ]; then
+                    log_warning "Coverage BED file missing or empty. Cannot use evidence-based method."
+                    log "Falling back to traditional HaplotypeCaller."
+                    RNA_CALLING_METHOD="traditional"
+                else
+                    COVERAGE_REGIONS=$(wc -l < "${COVERAGE_BED}")
+                    log "Calling variants with Mutect2 on ${COVERAGE_REGIONS} covered regions..."
+
+                    # ====== CRITICAL FIX: Mutect2 requires -tumor designation ======
+                    $GATK Mutect2 \
+                        -R "${REF_GENOME}" \
+                        -I "${INPUT_FOR_VARIANTS}" \
+                        -tumor "${SAMPLE_GROUP}_${SAMPLE}" \  # Uses Project ID + SRA ID
+                        -O "${RAW_VCF}" \
+                        -L "${COVERAGE_BED}" \
+                        --dont-use-soft-clipped-bases true \
+                        --minimum-mapping-quality ${MIN_MAPQ} \
+                        --minimum-base-quality-score ${MIN_BASE_QUALITY} \  # Fixed missing space
+                        --native-pair-hmm-threads ${GATK_THREADS} \
+                        --max-reads-per-alignment-start 100 \
+                        --downsampling-stride 20 \
+                        --max-suspicious-reads-per-alignment-start 6
+
+                    # Check if Mutect2 succeeded
+                    if [ ! -f "${RAW_VCF}" ] || [ ! -s "${RAW_VCF}" ]; then
+                        log_warning "Mutect2 failed to produce VCF. Falling back to HaplotypeCaller."
+                        RNA_CALLING_METHOD="traditional"
+                        # Remove failed output to avoid confusion
+                        rm -f "${RAW_VCF}" 2>/dev/null || true
+                    fi
+                fi
+                ;;
+
+            "traditional"|*)
+                # ====== MODIFIED: Support parallel HaplotypeCaller mode ======
+                if [ "${HAPLOTYPE_CALLER_MODE}" = "parallel" ]; then
+                    log "Using PARALLEL HaplotypeCaller (scatter-gather mode)..."
+                    run_parallel_haplotypecaller "${SAMPLE}" "${INPUT_FOR_VARIANTS}"
+                else
+                    log "Using SERIAL HaplotypeCaller..."
+                    $GATK HaplotypeCaller \
+                        -R "${REF_GENOME}" \
+                        -I "${INPUT_FOR_VARIANTS}" \
+                        -O "${RAW_VCF}" \
+                        --dont-use-soft-clipped-bases true \
+                        --standard-min-confidence-threshold-for-calling 20.0 \
+                        --min-base-quality-score 10 \
+                        --max-reads-per-alignment-start 50 \
+                        --max-assembly-region-size 500 \
+                        --pair-hmm-implementation LOGLESS_CACHING
+                fi
+                ;;
+        esac
+
+        # Final check if variant calling produced output
+        if [ ! -f "${RAW_VCF}" ] || [ ! -s "${RAW_VCF}" ]; then
+            log_error "Variant calling failed to produce output VCF"
+            return 1
+        fi
     fi
 
     ##################################
@@ -3061,7 +3365,8 @@ process_sample() {
     if [ -f "${FILTERED_VCF}" ]; then
         log "Variants already filtered: ${FILTERED_VCF}"
     else
-        log "Filtering RNA-seq variants (relaxed thresholds)..."
+        # ====== CRITICAL FIX: Remove ReadPosRankSum for RNA-seq ======
+        log "Filtering RNA-seq variants (RNA-appropriate thresholds)..."
         $GATK VariantFiltration \
             -R "${REF_GENOME}" \
             -V "${RAW_VCF}" \
@@ -3069,8 +3374,7 @@ process_sample() {
             --filter-expression "FS > 30.0" --filter-name "FS" \
             --filter-expression "SOR > 3.0" --filter-name "SOR" \
             --filter-expression "MQ < 40.0" --filter-name "LowMQ" \
-            --filter-expression "MQRankSum < -12.5" --filter-name "MQRankSum" \
-            --filter-expression "ReadPosRankSum < -8.0" --filter-name "ReadPosRankSum" \
+            --filter-expression "QUAL < 30.0" --filter-name "LowQual" \
             --window 35 --cluster 3 \
             -O "${FILTERED_VCF}"
     fi
@@ -3101,7 +3405,7 @@ process_sample() {
     if [ -f "${GENES_VCF}" ] && [ -s "${GENES_VCF}" ]; then
         log "Variants already annotated: ${GENES_VCF}"
     else
-        log "Annotating RNA-seq variants with SnpEff..."
+        log "Annotating RNA-seq variants..."
 
         # First, check PASS VCF has variants
         PASS_COUNT=$(bcftools view -H "${PASS_VCF}" 2>/dev/null | wc -l)
@@ -3114,281 +3418,93 @@ process_sample() {
             INPUT_FOR_ANNOTATION="${PASS_VCF}"
         fi
 
-        # Download and install SnpEff if needed - WITH IMPROVED ERROR HANDLING
+        # ====== IMPROVED: More robust SnpEff availability check ======
         SNPEFF_DIR="${TOOLS_DIR}/snpEff"
         SNPEFF_JAR="${SNPEFF_DIR}/snpEff.jar"
-        SNPEFF_CONFIG="${SNPEFF_DIR}/snpEff.config"
-        SNPEFF_DATA_DIR="${SNPEFF_DIR}/data"
 
-        # Create SnpEff directory if it doesn't exist
-        mkdir -p "${SNPEFF_DIR}"
-
-        # Download SnpEff if needed - with better error handling
-        if [ ! -f "${SNPEFF_JAR}" ]; then
-            log "Downloading SnpEff..."
-            cd "${SNPEFF_DIR}"
-
-            # Try multiple download sources
-            DOWNLOAD_SUCCESS=false
-            if wget -q --tries=3 --timeout=120 -O snpEff_latest_core.zip \
-                "https://snpeff.blob.core.windows.net/versions/snpEff_latest_core.zip"; then
-                DOWNLOAD_SUCCESS=true
-            elif wget -q --tries=3 --timeout=120 -O snpEff_latest_core.zip \
-                "https://sourceforge.net/projects/snpeff/files/latest/download"; then
-                DOWNLOAD_SUCCESS=true
-            fi
-
-            if ! $DOWNLOAD_SUCCESS; then
-                log_warning "Failed to download SnpEff from primary sources"
-                log "Trying direct GitHub download..."
-
-                if wget -q --tries=2 --timeout=120 -O snpEff_latest_core.zip \
-                    "https://github.com/pcingola/SnpEff/archive/refs/tags/v5.0e.zip"; then
-                    DOWNLOAD_SUCCESS=true
-                fi
-            fi
-
-            if $DOWNLOAD_SUCCESS && [ -f "snpEff_latest_core.zip" ]; then
-                log "Extracting SnpEff..."
-                if ! unzip -q snpEff_latest_core.zip 2>/dev/null; then
-                    log_warning "Failed to unzip SnpEff, trying with verbose output..."
-                    unzip snpEff_latest_core.zip || {
-                        log_warning "Failed to extract SnpEff"
-                    }
-                fi
-
-                # Find the actual jar file
-                if [ ! -f "snpEff.jar" ]; then
-                    # Look for jar in extracted directories
-                    SNPEFF_JAR_FILE=$(find . -name "snpEff.jar" -type f | head -1)
-                    if [ -n "${SNPEFF_JAR_FILE}" ]; then
-                        log "Found SnpEff at: ${SNPEFF_JAR_FILE}"
-                        # Ensure we have the right path
-                        SNPEFF_JAR="${SNPEFF_JAR_FILE}"
-                    else
-                        log_warning "Could not find snpEff.jar after extraction"
-                        # Try to find any jar file
-                        ANY_JAR=$(find . -name "*.jar" -type f | head -1)
-                        if [ -n "${ANY_JAR}" ]; then
-                            log "Found alternative jar: ${ANY_JAR}"
-                            cp "${ANY_JAR}" "${SNPEFF_DIR}/snpEff.jar"
-                            SNPEFF_JAR="${SNPEFF_DIR}/snpEff.jar"
-                        fi
-                    fi
-                fi
-
-                rm -f snpEff_latest_core.zip
+        # Check if SnpEff is properly installed and working
+        SNPEFF_AVAILABLE=false
+        if [ -f "${SNPEFF_JAR}" ] && [ -s "${SNPEFF_JAR}" ]; then
+            # Test if it actually runs
+            if java -jar "${SNPEFF_JAR}" -version 2>&1 | grep -q -i "snpeff\|version"; then
+                SNPEFF_AVAILABLE=true
+                log "SnpEff verified and working: ${SNPEFF_JAR}"
             else
-                log_error "Could not download SnpEff. Please install manually:"
-                log "  wget https://snpeff.blob.core.windows.net/versions/snpEff_latest_core.zip"
-                log "  unzip snpEff_latest_core.zip -d ${TOOLS_DIR}/"
-                return 1
+                log_warning "SnpEff JAR exists but doesn't run properly"
             fi
         fi
 
-        # Check if SnpEff jar exists and is executable
-        if [ ! -f "${SNPEFF_JAR}" ] || [ ! -s "${SNPEFF_JAR}" ]; then
-            log_warning "SnpEff jar not found or is empty: ${SNPEFF_JAR}"
-            log "Creating minimal fallback annotation..."
+        if ! $SNPEFF_AVAILABLE; then
+            log "SnpEff not available, will use fallback annotation methods"
             ANNOTATION_METHOD="fallback"
         else
-            # Make sure it's executable
-            chmod +x "${SNPEFF_JAR}" 2>/dev/null || true
-
-            # Create config if missing
-            if [ ! -f "${SNPEFF_CONFIG}" ]; then
-                log "Creating SnpEff config file..."
-                cat > "${SNPEFF_CONFIG}" << 'CONFIG'
-# SnpEff configuration file
-data.dir = ${SNPEFF_DIR}/data
-# hg38 database configuration
-hg38.genome : Human (hg38)
-hg38.reference : ${REF_GENOME}
-CONFIG
-            fi
-
             # Determine database name to use
             DB_NAME="hg38"
-            # Check if database already exists
+            SNPEFF_DATA_DIR="${SNPEFF_DIR}/data"
+
+            # Check if database exists
             if [ -d "${SNPEFF_DATA_DIR}/hg38" ] && [ -n "$(ls -A "${SNPEFF_DATA_DIR}/hg38" 2>/dev/null)" ]; then
                 log "Found existing hg38 database"
-            elif [ -d "${SNPEFF_DATA_DIR}/GRCh38.86" ] && [ -n "$(ls -A "${SNPEFF_DATA_DIR}/GRCh38.86" 2>/dev/null)" ]; then
-                log "Found GRCh38.86 database, using that instead"
-                DB_NAME="GRCh38.86"
-            elif [ -d "${SNPEFF_DATA_DIR}/GRCh38.p13" ] && [ -n "$(ls -A "${SNPEFF_DATA_DIR}/GRCh38.p13" 2>/dev/null)" ]; then
-                log "Found GRCh38.p13 database, using that instead"
-                DB_NAME="GRCh38.p13"
             else
-                # Download database if needed - WITH BETTER ERROR CHECKING
-                log "Downloading SnpEff database for ${DB_NAME}..."
-                log "This may take several minutes (database is ~1GB)..."
-
-                # Set Java memory options
-                export JAVA_OPTS="-Xmx8g -Xms2g"
-
                 # Try to download database
+                log "Downloading SnpEff database for ${DB_NAME}..."
                 DB_LOG="${VCF_DIR}/${SAMPLE}.snpeff_download.log"
-                if ! java ${JAVA_OPTS} -jar "${SNPEFF_JAR}" download -v "${DB_NAME}" 2>&1 | tee "${DB_LOG}"; then
-                    log_warning "SnpEff database download failed or had errors"
+                if ! java -Xmx8g -jar "${SNPEFF_JAR}" download -v "${DB_NAME}" 2>&1 | tee "${DB_LOG}"; then
+                    log_warning "SnpEff database download failed, trying alternative names..."
 
-                    # Check log for specific errors
-                    if grep -q "Unknown genome\|not found" "${DB_LOG}"; then
-                        log "Trying alternative database names..."
-                        # Try with different database names
-                        for alt_db in "GRCh38.86" "GRCh38.p13" "hg38"; do
-                            if [ "${alt_db}" != "${DB_NAME}" ]; then
-                                log "Trying database: ${alt_db}"
-                                if java ${JAVA_OPTS} -jar "${SNPEFF_JAR}" download -v "${alt_db}" 2>&1 | tee -a "${DB_LOG}"; then
-                                    log "Successfully downloaded database: ${alt_db}"
-                                    DB_NAME="${alt_db}"
-                                    break
-                                fi
-                            fi
-                        done
-                    fi
-
-                    # Check if database was actually downloaded
-                    if [ ! -d "${SNPEFF_DATA_DIR}/${DB_NAME}" ] || [ -z "$(ls -A "${SNPEFF_DATA_DIR}/${DB_NAME}" 2>/dev/null)" ]; then
-                        log_warning "Could not download SnpEff database."
-                        log "Creating minimal database structure for basic annotation..."
-                        mkdir -p "${SNPEFF_DATA_DIR}/${DB_NAME}"
-                        echo "# Minimal database" > "${SNPEFF_DATA_DIR}/${DB_NAME}/genes.gbk"
-                        ANNOTATION_METHOD="simple"
-                    fi
-                else
-                    log "SnpEff database download completed for ${DB_NAME}"
+                    for alt_db in "GRCh38.105" "GRCh38.86" "GRCh38.p13"; do
+                        log "Trying database: ${alt_db}"
+                        if java -Xmx8g -jar "${SNPEFF_JAR}" download -v "${alt_db}" 2>&1 | tee -a "${DB_LOG}"; then
+                            DB_NAME="${alt_db}"
+                            log "Successfully downloaded database: ${DB_NAME}"
+                            break
+                        fi
+                    done
                 fi
             fi
 
-            # Test SnpEff with a small subset first
-            log "Testing SnpEff with 10 variants..."
+            # Test with small subset
             TEST_VCF="${VCF_DIR}/${SAMPLE}.test.vcf"
-
-            # Extract a few variants with header
             bcftools view -h "${INPUT_FOR_ANNOTATION}" 2>/dev/null > "${TEST_VCF}.header"
             bcftools view -H "${INPUT_FOR_ANNOTATION}" 2>/dev/null | head -10 > "${TEST_VCF}.variants"
             cat "${TEST_VCF}.header" "${TEST_VCF}.variants" > "${TEST_VCF}"
 
-            # Set Java memory for test
-            TEST_JAVA_OPTS="-Xmx4g -Xms1g"
-
-            # Run test annotation
             TEST_LOG="${VCF_DIR}/${SAMPLE}.snpeff_test.log"
-            log "Running SnpEff test with database: ${DB_NAME}"
-
-            if java ${TEST_JAVA_OPTS} -jar "${SNPEFF_JAR}" -v -c "${SNPEFF_CONFIG}" "${DB_NAME}" "${TEST_VCF}" 2>&1 | tee "${TEST_LOG}"; then
-                # Check if test produced output
+            if java -Xmx4g -jar "${SNPEFF_JAR}" -v "${DB_NAME}" "${TEST_VCF}" 2>&1 | tee "${TEST_LOG}"; then
                 TEST_OUTPUT="${TEST_VCF}.snpeff"
                 if [ -f "${TEST_OUTPUT}" ] && [ -s "${TEST_OUTPUT}" ]; then
                     TEST_VARIANTS=$(grep -v "^#" "${TEST_OUTPUT}" | wc -l)
                     log "SnpEff test successful (${TEST_VARIANTS} variants annotated)"
-
-                    # Check if ANN field was added
-                    if grep -q "^##INFO=<ID=ANN" "${TEST_OUTPUT}"; then
-                        log "SnpEff ANN field detected in test output"
-                        ANNOTATION_METHOD="snpeff"
-                    else
-                        log_warning "SnpEff test succeeded but no ANN field added"
-                        ANNOTATION_METHOD="simple"
-                    fi
+                    ANNOTATION_METHOD="snpeff"
                 else
-                    log_warning "SnpEff test produced no output file"
-                    ANNOTATION_METHOD="fallback"
-                fi
-            else
-                log_warning "SnpEff test failed with exit code $?"
-                log "Checking test log for errors..."
-
-                # Check for common errors
-                if grep -qi "out of memory\|java.lang.OutOfMemoryError" "${TEST_LOG}"; then
-                    log_warning "SnpEff ran out of memory. Increasing heap size..."
-                    TEST_JAVA_OPTS="-Xmx12g -Xms2g"
-                    # Retry test with more memory
-                    if java ${TEST_JAVA_OPTS} -jar "${SNPEFF_JAR}" -v -c "${SNPEFF_CONFIG}" "${DB_NAME}" "${TEST_VCF}" 2>&1 | tee -a "${TEST_LOG}"; then
-                        log "Test succeeded with increased memory"
-                        ANNOTATION_METHOD="snpeff"
-                    else
-                        ANNOTATION_METHOD="bcftools"
-                    fi
-                elif grep -qi "genome not found\|unknown genome" "${TEST_LOG}"; then
-                    log_warning "Genome '${DB_NAME}' not found in SnpEff database"
-
-                    # Try to find the correct database
-                    if [ -d "${SNPEFF_DATA_DIR}/GRCh38.86" ]; then
-                        log "Trying with GRCh38.86 database..."
-                        DB_NAME="GRCh38.86"
-                        ANNOTATION_METHOD="retry"
-                    elif [ -d "${SNPEFF_DATA_DIR}/GRCh38.p13" ]; then
-                        log "Trying with GRCh38.p13 database..."
-                        DB_NAME="GRCh38.p13"
-                        ANNOTATION_METHOD="retry"
-                    else
-                        log_warning "No suitable database found, using simple annotation"
-                        ANNOTATION_METHOD="simple"
-                    fi
-                else
-                    log_warning "Unknown SnpEff error. Using bcftools for annotation."
                     ANNOTATION_METHOD="bcftools"
                 fi
+            else
+                ANNOTATION_METHOD="bcftools"
             fi
-
-            # Cleanup test files
-            rm -f "${TEST_VCF}" "${TEST_VCF}.header" "${TEST_VCF}.variants" "${TEST_VCF}.snpeff" 2>/dev/null || true
-            # Cleanup test log if empty
-            [ ! -s "${TEST_LOG}" ] && rm -f "${TEST_LOG}" 2>/dev/null || true
-
-            # Handle retry if needed
-            if [ "${ANNOTATION_METHOD}" = "retry" ]; then
-                log "Retrying with database: ${DB_NAME}"
-                ANNOTATION_METHOD="snpeff"
-            fi
+            rm -f "${TEST_VCF}"* "${TEST_LOG}" 2>/dev/null || true
         fi
 
-        # Handle different annotation methods
+        # ====== MODIFIED: Handle annotation with updated flow ======
         case "${ANNOTATION_METHOD}" in
             "snpeff")
                 log "Running full SnpEff annotation with database: ${DB_NAME}"
-                FULL_LOG="${VCF_DIR}/${SAMPLE}.snpeff_full.log"
                 SNPEFF_VCF="${VCF_DIR}/${SAMPLE}.snpeff.vcf"
+                FULL_LOG="${VCF_DIR}/${SAMPLE}.snpeff_full.log"
 
-                # Set final Java options
-                FINAL_JAVA_OPTS="${TEST_JAVA_OPTS:--Xmx8g -Xms2g}"
-
-                # Run full annotation
-                log "Command: java ${FINAL_JAVA_OPTS} -jar ${SNPEFF_JAR} -v -c ${SNPEFF_CONFIG} ${DB_NAME} ${INPUT_FOR_ANNOTATION}"
-
-                if java ${FINAL_JAVA_OPTS} -jar "${SNPEFF_JAR}" -v -c "${SNPEFF_CONFIG}" "${DB_NAME}" \
-                    -canon -noLog -stats "${VCF_DIR}/${SAMPLE}.snpeff.html" \
+                if java -Xmx8g -jar "${SNPEFF_JAR}" -v "${DB_NAME}" \
                     "${INPUT_FOR_ANNOTATION}" > "${SNPEFF_VCF}" 2>"${FULL_LOG}"; then
 
-                    # Check output
                     if [ -s "${SNPEFF_VCF}" ]; then
-                        ANNOTATED_COUNT=$(grep -v "^#" "${SNPEFF_VCF}" | wc -l)
-                        log "SnpEff annotated ${ANNOTATED_COUNT} variants"
-
-                        # Convert to bgzip and index
                         bgzip -c "${SNPEFF_VCF}" > "${ANNOTATED_VCF}"
                         tabix -p vcf "${ANNOTATED_VCF}"
-
-                        # Verify the output
-                        if [ -f "${ANNOTATED_VCF}" ] && [ -s "${ANNOTATED_VCF}" ]; then
-                            FINAL_CHECK=$(bcftools view -H "${ANNOTATED_VCF}" 2>/dev/null | wc -l)
-                            log "Verified ${FINAL_CHECK} variants in final annotated VCF"
-                        else
-                            log_warning "Annotated VCF is empty after compression"
-                            log "Falling back to simple annotation..."
-                            ANNOTATION_METHOD="simple"
-                        fi
+                        log "SnpEff annotation completed"
                     else
-                        log_warning "SnpEff produced empty output file"
-                        log "Falling back to simple annotation..."
-                        ANNOTATION_METHOD="simple"
+                        log_warning "SnpEff produced empty output"
+                        ANNOTATION_METHOD="bcftools"
                     fi
                 else
-                    log_warning "SnpEff annotation failed with exit code $?"
-                    log "Last 20 lines of SnpEff log:"
-                    tail -20 "${FULL_LOG}" 2>/dev/null || true
-                    log "Falling back to bcftools annotation..."
+                    log_warning "SnpEff annotation failed"
                     ANNOTATION_METHOD="bcftools"
                 fi
                 ;;
@@ -3396,7 +3512,6 @@ CONFIG
             "bcftools")
                 log "Using bcftools csq for annotation..."
                 if command -v bcftools > /dev/null && [ -f "${REF_GENOME}" ]; then
-                    # Check if we have GTF file
                     GTF_FILE="${BASE_DIR}/references/annotations/gencode.v49.annotation.gtf"
                     if [ -f "${GTF_FILE}" ] || [ -f "${GTF_FILE}.gz" ]; then
                         if [ -f "${GTF_FILE}.gz" ]; then
@@ -3406,42 +3521,31 @@ CONFIG
                             GTF_INPUT="${GTF_FILE}"
                         fi
 
-                        log "Running bcftools csq..."
                         if bcftools csq -f "${REF_GENOME}" -g "${GTF_INPUT}" \
                             "${INPUT_FOR_ANNOTATION}" -O z -o "${ANNOTATED_VCF}" 2>"${VCF_DIR}/${SAMPLE}.bcftools_csq.log"; then
-
                             if [ -f "${ANNOTATED_VCF}" ] && [ -s "${ANNOTATED_VCF}" ]; then
                                 tabix -p vcf "${ANNOTATED_VCF}"
-                                log "bcftools csq annotation completed successfully"
+                                log "bcftools csq annotation completed"
                             else
-                                log_warning "bcftools csq produced empty output"
                                 ANNOTATION_METHOD="simple"
                             fi
                         else
-                            log_warning "bcftools csq failed"
                             ANNOTATION_METHOD="simple"
                         fi
-
-                        if [ -f "${GTF_FILE}.temp" ]; then
-                            rm -f "${GTF_FILE}.temp"
-                        fi
+                        [ -f "${GTF_FILE}.temp" ] && rm -f "${GTF_FILE}.temp"
                     else
-                        log_warning "GTF file not found for bcftools csq"
                         ANNOTATION_METHOD="simple"
                     fi
                 else
-                    log_warning "bcftools or reference genome not available"
                     ANNOTATION_METHOD="simple"
                 fi
                 ;;
 
             "simple"|"fallback")
                 log "Using simple annotation (adding GENE info only)..."
-                # Just copy the input VCF and add gene annotations
                 cp "${INPUT_FOR_ANNOTATION}" "${ANNOTATED_VCF}"
                 cp "${INPUT_FOR_ANNOTATION}.tbi" "${ANNOTATED_VCF}.tbi"
 
-                # Add gene annotations if bed file exists
                 if [ -f "${BASE_DIR}/references/annotations/genes.bed.gz" ]; then
                     log "Adding gene annotations from BED file..."
                     TEMP_VCF="${VCF_DIR}/${SAMPLE}.temp_gene.vcf.gz"
@@ -3462,13 +3566,12 @@ CONFIG
 
             *)
                 log_warning "Unknown annotation method: ${ANNOTATION_METHOD}"
-                log "Using filtered VCF without annotation..."
                 cp "${INPUT_FOR_ANNOTATION}" "${ANNOTATED_VCF}"
                 cp "${INPUT_FOR_ANNOTATION}.tbi" "${ANNOTATED_VCF}.tbi"
                 ;;
         esac
 
-        # Continue with dbSNP and gene annotation regardless of method
+        # Continue with dbSNP and gene annotation
         if [ -f "${ANNOTATED_VCF}" ] && [ -s "${ANNOTATED_VCF}" ]; then
             log "Adding dbSNP IDs..."
             bcftools annotate \
@@ -3478,9 +3581,8 @@ CONFIG
                 -o "${RSID_VCF}" \
                 "${ANNOTATED_VCF}" 2>"${VCF_DIR}/${SAMPLE}.rsid.log"
 
-            # Check rsID annotation worked
             if [ ! -s "${RSID_VCF}" ]; then
-                log_warning "dbSNP annotation failed! Using original annotated VCF."
+                log_warning "dbSNP annotation failed!"
                 cp "${ANNOTATED_VCF}" "${RSID_VCF}"
                 cp "${ANNOTATED_VCF}.tbi" "${RSID_VCF}.tbi"
             fi
@@ -3494,14 +3596,12 @@ CONFIG
                 -o "${GENES_VCF}" \
                 "${RSID_VCF}" 2>"${VCF_DIR}/${SAMPLE}.gene_anno.log"
 
-            # Check gene annotation worked
             if [ ! -s "${GENES_VCF}" ]; then
-                log_warning "Gene annotation failed! Using rsID VCF."
+                log_warning "Gene annotation failed!"
                 cp "${RSID_VCF}" "${GENES_VCF}"
                 cp "${RSID_VCF}.tbi" "${GENES_VCF}.tbi"
             fi
 
-            # Final check
             FINAL_COUNT=$(bcftools view -H "${GENES_VCF}" 2>/dev/null | wc -l)
             log "Final annotated VCF has ${FINAL_COUNT} variants"
         else
@@ -3521,17 +3621,16 @@ CONFIG
     else
         log "Exporting RNA-seq variants to TSV..."
 
-        # Use genes.vcf.gz or fallback to annotated.vcf.gz
+        # Use genes.vcf.gz or fallback
         if [ -f "${GENES_VCF}" ] && [ -s "${GENES_VCF}" ]; then
             INPUT_VCF="${GENES_VCF}"
         elif [ -f "${ANNOTATED_VCF}" ] && [ -s "${ANNOTATED_VCF}" ]; then
             INPUT_VCF="${ANNOTATED_VCF}"
         else
             INPUT_VCF="${PASS_VCF}"
-            log_warning "Using PASS VCF for TSV export (annotation files missing)"
+            log_warning "Using PASS VCF for TSV export"
         fi
 
-        # Check variant count
         VAR_COUNT=$(bcftools view -H "${INPUT_VCF}" 2>/dev/null | wc -l)
         log "Exporting ${VAR_COUNT} RNA-seq variants to TSV"
 
@@ -3542,12 +3641,10 @@ CONFIG
             # Try to extract SnpEff annotations
             echo -e "CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tGENE\tANNOTATION\tIMPACT\tGT\tDP\tAD\tGQ" > "${TSV_FILE}"
 
-            # Try to get SnpEff ANN field
             bcftools query \
                 -f '%CHROM\t%POS\t%ID\t%REF\t%ALT\t%QUAL\t%FILTER\t%INFO/ANN\n' \
                 "${INPUT_VCF}" 2>/dev/null | \
             awk -F'\t' '{
-                # Parse ANN field (Format: Allele|Annotation|Impact|GeneName...)
                 split($8, ann, "|");
                 gene = ann[4];
                 annotation = ann[2];
@@ -3555,7 +3652,6 @@ CONFIG
                 print $1 "\t" $2 "\t" $3 "\t" $4 "\t" $5 "\t" $6 "\t" $7 "\t" gene "\t" annotation "\t" impact;
             }' >> "${TSV_FILE}"
 
-            # If no ANN field, try simpler format
             if [ $(wc -l < "${TSV_FILE}") -le 1 ]; then
                 log "No ANN field found, using simple format..."
                 echo -e "CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tGENE\tGT\tDP\tAD\tGQ" > "${TSV_FILE}"
@@ -3565,21 +3661,114 @@ CONFIG
             fi
         fi
 
-        # Check result
         TSV_LINES=$(wc -l < "${TSV_FILE}")
         log "TSV exported with ${TSV_LINES} lines"
 
         if [ "${TSV_LINES}" -gt 1 ]; then
-            log "Success! Compressing TSV..."
             pigz -f -p 2 "${TSV_FILE}" 2>/dev/null || gzip -f "${TSV_FILE}"
         else
-            log_warning "TSV export failed - keeping empty file for debugging"
+            log_warning "TSV export failed - keeping empty file"
             pigz -f -p 2 "${TSV_FILE}" 2>/dev/null || gzip -f "${TSV_FILE}"
         fi
     fi
 
     log "Finished processing RNA-seq sample ${SAMPLE}"
     log "TSV file created: ${TSV_DIR}/${SAMPLE}.tsv.gz"
+}
+
+run_parallel_haplotypecaller() {
+    local SAMPLE="$1"
+    local INPUT_BAM="$2"
+
+    log "Running PARALLEL HaplotypeCaller for ${SAMPLE}"
+
+    # Generate intervals if needed
+    if [ ! -f "${INTERVAL_FILE}" ] || [ ! -s "${INTERVAL_FILE}" ]; then
+        generate_intervals
+    fi
+
+    # Create output directory for interval VCFs
+    INTERVAL_DIR="${BASE_DIR}/data/vcf/${SAMPLE}/intervals"
+    mkdir -p "${INTERVAL_DIR}"
+
+    # Split intervals into chunks for parallel processing
+    TOTAL_INTERVALS=$(wc -l < "${INTERVAL_FILE}")
+    INTERVALS_PER_JOB=$(( (TOTAL_INTERVALS + PARALLEL_JOBS - 1) / PARALLEL_JOBS ))
+
+    log "Splitting ${TOTAL_INTERVALS} intervals into ${PARALLEL_JOBS} jobs"
+
+    # Create interval chunks
+    split -l "${INTERVALS_PER_JOB}" "${INTERVAL_FILE}" "${INTERVAL_DIR}/interval_chunk_"
+
+    # Process each chunk in parallel
+    CHUNK_FILES=("${INTERVAL_DIR}"/interval_chunk_*)
+
+    for chunk_file in "${CHUNK_FILES[@]}"; do
+        if [ -f "${chunk_file}" ]; then
+            # Create interval list for this chunk
+            CHUNK_NAME=$(basename "${chunk_file}")
+            INTERVAL_LIST="${INTERVAL_DIR}/${CHUNK_NAME}.list"
+
+            # Convert to GATK interval list format
+            echo -e "@HD\tVN:1.6\tSO:unsorted" > "${INTERVAL_LIST}"
+            echo -e "@SQ\tSN:chr1\tLN:248956422" >> "${INTERVAL_LIST}"  # Simplified
+            cat "${chunk_file}" | while IFS= read -r interval; do
+                echo -e "${interval}" >> "${INTERVAL_LIST}"
+            done
+
+            # Run HaplotypeCaller for this chunk (in background)
+            (
+                CHUNK_VCF="${INTERVAL_DIR}/${CHUNK_NAME}.vcf.gz"
+                log "Starting HaplotypeCaller for ${CHUNK_NAME}"
+
+                $GATK HaplotypeCaller \
+                    -R "${REF_GENOME}" \
+                    -I "${INPUT_BAM}" \
+                    -O "${CHUNK_VCF}" \
+                    -L "${INTERVAL_LIST}" \
+                    --dont-use-soft-clipped-bases true \
+                    --standard-min-confidence-threshold-for-calling 20.0 \
+                    --min-base-quality-score 10 \
+                    --max-reads-per-alignment-start 50 \
+                    --max-assembly-region-size 500 \
+                    --pair-hmm-implementation LOGLESS_CACHING
+
+                log "Completed ${CHUNK_NAME}"
+            ) &
+
+            # Limit number of concurrent jobs
+            BACKGROUND_JOBS=$(jobs -p | wc -l)
+            while [ "${BACKGROUND_JOBS}" -ge "${PARALLEL_JOBS}" ]; do
+                sleep 10
+                BACKGROUND_JOBS=$(jobs -p | wc -l)
+            done
+        fi
+    done
+
+    # Wait for all background jobs to complete
+    log "Waiting for ${#CHUNK_FILES[@]} parallel HaplotypeCaller jobs to complete..."
+    wait
+
+    # Merge all interval VCFs
+    log "Merging interval VCFs..."
+    RAW_VCF="${BASE_DIR}/data/vcf/${SAMPLE}/${SAMPLE}.vcf.gz"
+
+    # Create input list for merge
+    MERGE_LIST="${INTERVAL_DIR}/merge_list.txt"
+    find "${INTERVAL_DIR}" -name "*.vcf.gz" -type f | sort > "${MERGE_LIST}"
+
+    if [ -s "${MERGE_LIST}" ]; then
+        $GATK MergeVcfs \
+            -I "${MERGE_LIST}" \
+            -O "${RAW_VCF}"
+
+        log "Successfully merged interval VCFs into ${RAW_VCF}"
+    else
+        log_error "No interval VCFs found to merge"
+        return 1
+    fi
+
+    return 0
 }
 
 ############################################################
