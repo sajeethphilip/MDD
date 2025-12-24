@@ -602,3 +602,28 @@ ensure_tools_installed() {
         return $?
     fi
 }
+
+# Uninstall current bcftools
+cd ~/.local/mdd2_tools
+rm -rf bin/bcftools bin/samtools
+
+# Reinstall with conda (recommended)
+conda install -c bioconda bcftools samtools -y
+
+# OR recompile from source
+cd ~/.local/mdd2_tools/build
+wget https://github.com/samtools/bcftools/releases/download/1.19/bcftools-1.19.tar.bz2
+tar -xjf bcftools-1.19.tar.bz2
+cd bcftools-1.19
+./configure --prefix="$HOME/.local/mdd2_tools" --disable-libcurl
+make
+make install
+
+cd ~/.local/mdd2_tools
+# Remove any previous failed attempts
+rm -rf snpEff/
+# Download using the current official command[citation:5]
+curl -v -L 'https://snpeff-public.s3.amazonaws.com/versions/snpEff_latest_core.zip' > snpEff_latest_core.zip
+# Proceed with installation
+unzip -q snpEff_latest_core.zip
+rm -f snpEff_latest_core.zip
