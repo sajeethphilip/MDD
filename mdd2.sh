@@ -209,9 +209,9 @@ install_funcotator_data() {
     local FUNCOTATOR_DS="${BASE_DIR}/references/annotations/funcotator_dataSources"
     mkdir -p "${FUNCOTATOR_DS}"
 
-    # Check if already installed
-    if [ -d "${FUNCOTATOR_DS}/hg38" ] && [ "$(ls -A "${FUNCOTATOR_DS}/hg38" 2>/dev/null | wc -l)" -gt 10 ]; then
-        log "Funcotator data sources already exist at: ${FUNCOTATOR_DS}"
+    # Check if already installed - More robust check for hg38 directory and content
+    if [ -d "${FUNCOTATOR_DS}/hg38" ] && [ "$(find "${FUNCOTATOR_DS}/hg38" -type f 2>/dev/null | wc -l)" -gt 100 ]; then
+        log "Funcotator data sources already exist and appear complete at: ${FUNCOTATOR_DS}"
         return 0
     fi
 
@@ -233,19 +233,28 @@ install_funcotator_data() {
         fi
     fi
 
-    # Try GATK downloader
+    # Try GATK downloader WITH --overwrite-output-file flag
     if [ -n "${GATK}" ] && [ -x "${GATK}" ]; then
-        log "Starting Funcotator download with GATK..."
+        log "Starting Funcotator download with GATK (using --overwrite-output-file)..."
+
+        # Clean up any existing incomplete directory first
+        if [ -d "${FUNCOTATOR_DS}" ] && [ "$(ls -A "${FUNCOTATOR_DS}" 2>/dev/null | wc -l)" -lt 10 ]; then
+            log "Found incomplete/corrupt Funcotator directory, cleaning up..."
+            rm -rf "${FUNCOTATOR_DS}"
+            mkdir -p "${FUNCOTATOR_DS}"
+        fi
 
         # Create a background process to monitor download
         (
             LOG_FILE="${BASE_DIR}/logs/funcotator_download.log"
             echo "Funcotator download started at: $(date)" > "${LOG_FILE}"
 
+            # CRITICAL: Added --overwrite-output-file flag here
             ${GATK} FuncotatorDataSourceDownloader \
                 --somatic \
                 --hg38 \
                 --extract-after-download \
+                --overwrite-output-file \
                 --output "${FUNCOTATOR_DS}" \
                 --verbosity INFO 2>&1 | tee -a "${LOG_FILE}"
 
@@ -253,6 +262,8 @@ install_funcotator_data() {
                 echo "SUCCESS: Funcotator download completed at: $(date)" >> "${LOG_FILE}"
             else
                 echo "ERROR: Funcotator download failed at: $(date)" >> "${LOG_FILE}"
+                echo "Last 20 lines of output:" >> "${LOG_FILE}"
+                tail -20 "${LOG_FILE}" >> "${LOG_FILE}.error"
             fi
         ) &
 
@@ -286,7 +297,7 @@ install_funcotator_data() {
         log "You can manually download with:"
         log "  mkdir -p ${FUNCOTATOR_DS}"
         log "  cd ${FUNCOTATOR_DS}"
-        log "  wget https://storage.googleapis.com/gatk-best-practices/funcotator/funcotator_dataSources.v1.7.20200521g.tar.gz"
+        log "  wget ftp://gsapubftp-anonymous@ftp.broadinstitute.org/bundle/funcotator/funcotator_dataSources.v1.7.20200521g.tar.gz"
         log "  tar -xzf funcotator_dataSources.v1.7.20200521g.tar.gz"
         return 1
     fi
