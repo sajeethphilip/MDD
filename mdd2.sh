@@ -1266,43 +1266,58 @@ install_all_tools() {
 # Reference Data (Complete)
 ############################################################
 
+############################################################
+# Reference Data (MODIFIED - Checks for existing files)
+############################################################
+
 download_reference() {
-    log "Downloading reference genome..."
+    log "Checking and downloading reference files..."
     mkdir -p "$(dirname "${REF_GENOME}")"
 
-    wget -q -O "${REF_GENOME}.gz" "${REF_GENOME_URL}"
-
-    if [ -f "${REF_GENOME}.gz" ]; then
+    # 1. REFERENCE GENOME: Download only if missing
+    if [ ! -f "${REF_GENOME}" ] && [ ! -f "${REF_GENOME}.gz" ]; then
+        log "Downloading reference genome..."
+        wget -q -O "${REF_GENOME}.gz" "${REF_GENOME_URL}"
         gunzip "${REF_GENOME}.gz"
-
-        log "Indexing reference genome..."
-        if check_tool "samtools"; then
-            samtools faidx "${REF_GENOME}"
-        else
-            log "WARNING: samtools not available, skipping faidx"
-        fi
-
-        if check_tool "gatk"; then
-            $GATK CreateSequenceDictionary \
-                -R "${REF_GENOME}" \
-                -O "${REF_GENOME%.fa}.dict"
-        else
-            log "WARNING: GATK not available, skipping CreateSequenceDictionary"
-        fi
     else
-        log "ERROR: Failed to download reference genome"
-        return 1
+        if [ -f "${REF_GENOME}.gz" ]; then
+            log "Reference genome .gz found, extracting..."
+            gunzip -c "${REF_GENOME}.gz" > "${REF_GENOME}"
+        fi
+        log "Reference genome already exists: ${REF_GENOME}"
     fi
 
-    log "Downloading known sites..."
+    # 2. Index reference genome if needed
+    if [ ! -f "${REF_GENOME}.fai" ]; then
+        log "Indexing reference genome..."
+        samtools faidx "${REF_GENOME}" 2>/dev/null || log_warning "samtools faidx failed"
+    fi
+
+    if [ ! -f "${REF_GENOME%.fa}.dict" ] && [ ! -f "${REF_GENOME%.fa}.dict" ]; then
+        log "Creating sequence dictionary..."
+        $GATK CreateSequenceDictionary -R "${REF_GENOME}" -O "${REF_GENOME%.fa}.dict" 2>/dev/null ||
+            log_warning "GATK CreateSequenceDictionary failed"
+    fi
+
+    # 3. KNOWN SITES: Download only if missing
     mkdir -p "$(dirname "${DBSNP}")"
-    wget -q -O "${DBSNP}" "${DBSNP_URL}"
-    wget -q -O "${DBSNP}.tbi" "${DBSNP_URL}.tbi"
+    if [ ! -f "${DBSNP}" ]; then
+        log "Downloading dbSNP..."
+        wget -q -O "${DBSNP}" "${DBSNP_URL}"
+        wget -q -O "${DBSNP}.tbi" "${DBSNP_URL}.tbi" 2>/dev/null || true
+    else
+        log "dbSNP already exists: ${DBSNP}"
+    fi
 
-    wget -q -O "${MILLS}" "${MILLS_URL}"
-    wget -q -O "${MILLS}.tbi" "${MILLS_URL}.tbi"
+    if [ ! -f "${MILLS}" ]; then
+        log "Downloading Mills indels..."
+        wget -q -O "${MILLS}" "${MILLS_URL}"
+        wget -q -O "${MILLS}.tbi" "${MILLS_URL}.tbi" 2>/dev/null || true
+    else
+        log "Mills indels already exist: ${MILLS}"
+    fi
 
-    # Ensure GTF is downloaded if not already
+    # 4. GTF ANNOTATION: Download only if missing
     GTF_GZ="${BASE_DIR}/references/annotations/gencode.v49.annotation.gtf.gz"
     if [ ! -f "${GTF_GZ}" ]; then
         log "Downloading Gencode annotation GTF..."
@@ -1314,6 +1329,33 @@ download_reference() {
     fi
 
     return 0
+}
+
+setup_references() {
+    log "Setting up pipeline references (will skip existing files)..."
+    setup_environment
+
+    echo "Checking for required tools..."
+    REQUIRED_TOOLS=("java" "samtools" "bcftools" "bgzip" "tabix" "wget")
+    for tool in "${REQUIRED_TOOLS[@]}"; do
+        check_tool "${tool}"
+    done
+
+    check_tool "gatk"
+
+    echo ""
+    echo "Downloading reference files (skipping if already present)..."
+    download_reference
+    generate_gene_bed
+
+    echo ""
+    echo "Setting up annotation tools..."
+    setup_annotation_tools
+
+    echo ""
+    echo "Setup complete!"
+    echo "Edit the SRA_LIST array in the script to add your SRA IDs"
+    echo "Then run: ./$(basename "$0") run"
 }
 
 generate_gene_bed() {
