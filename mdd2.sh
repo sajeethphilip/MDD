@@ -2851,7 +2851,8 @@ process_sample_DNA() {
             -RGPL ILLUMINA \
             -RGPU "${SAMPLE}.unit1" \
             -RGSM "${SAMPLE}" \
-            --CREATE_INDEX true
+            --CREATE_INDEX true \
+            --SORT_ORDER coordinate
     fi
 
     ##################################
