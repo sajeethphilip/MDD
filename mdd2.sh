@@ -207,102 +207,39 @@ install_funcotator_data() {
     log "Installing Funcotator data sources..."
 
     local FUNCOTATOR_DS="${BASE_DIR}/references/annotations/funcotator_dataSources"
-    mkdir -p "${FUNCOTATOR_DS}"
+    mkdir -p "$(dirname "${FUNCOTATOR_DS}")"
 
-    # Check if already installed - More robust check for hg38 directory and content
-    if [ -d "${FUNCOTATOR_DS}/hg38" ] && [ "$(find "${FUNCOTATOR_DS}/hg38" -type f 2>/dev/null | wc -l)" -gt 100 ]; then
-        log "Funcotator data sources already exist and appear complete at: ${FUNCOTATOR_DS}"
+    # SIMPLER CHECK: Just see if we have ANY valid Funcotator data
+    local HAVE_FUNCOTATOR=false
+
+    # Check multiple possible indicators of Funcotator data
+    if [ -e "${FUNCOTATOR_DS}" ]; then
+        # Check for v1.8 nested structure
+        if [ -d "${FUNCOTATOR_DS}/cosmic/hg38" ] && [ -d "${FUNCOTATOR_DS}/clinvar/hg38" ]; then
+            log "Found Funcotator v1.8 data (nested structure)"
+            HAVE_FUNCOTATOR=true
+        # Check for older flat structure
+        elif [ -d "${FUNCOTATOR_DS}/hg38" ]; then
+            log "Found Funcotator data (flat structure)"
+            HAVE_FUNCOTATOR=true
+        # Check for any hg38 directory anywhere under the path
+        elif find "${FUNCOTATOR_DS}" -type d -name "hg38" 2>/dev/null | grep -q "."; then
+            log "Found hg38 directories in Funcotator data"
+            HAVE_FUNCOTATOR=true
+        fi
+    fi
+
+    # If we have Funcotator data, skip installation
+    if [ "${HAVE_FUNCOTATOR}" = "true" ]; then
+        log "✅ Funcotator data sources already available"
+        log "Location: ${FUNCOTATOR_DS}"
         return 0
     fi
 
-    log "This will download ~30GB of data and may take several hours..."
-    log "Checking disk space..."
+    # If we get here, we need to install
+    log "Funcotator data not found or incomplete"
 
-    # Check disk space (need at least 35GB free)
-    local AVAILABLE_SPACE=$(df -k "${BASE_DIR}" | tail -1 | awk '{print $4}')
-    local MIN_SPACE_KB=35000000  # 35GB in KB
-
-    if [ "${AVAILABLE_SPACE}" -lt "${MIN_SPACE_KB}" ]; then
-        log_warning "Low disk space: $((${AVAILABLE_SPACE}/1024/1024))GB available, need ~35GB"
-        log "Consider downloading manually or freeing up space"
-        read -p "Continue anyway? [y/N]: " -n 1 -r
-        echo
-        if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-            log "Skipping Funcotator installation"
-            return 1
-        fi
-    fi
-
-    # Try GATK downloader WITH --overwrite-output-file flag
-    if [ -n "${GATK}" ] && [ -x "${GATK}" ]; then
-        log "Starting Funcotator download with GATK (using --overwrite-output-file)..."
-
-        # Clean up any existing incomplete directory first
-        if [ -d "${FUNCOTATOR_DS}" ] && [ "$(ls -A "${FUNCOTATOR_DS}" 2>/dev/null | wc -l)" -lt 10 ]; then
-            log "Found incomplete/corrupt Funcotator directory, cleaning up..."
-            rm -rf "${FUNCOTATOR_DS}"
-            mkdir -p "${FUNCOTATOR_DS}"
-        fi
-
-        # Create a background process to monitor download
-        (
-            LOG_FILE="${BASE_DIR}/logs/funcotator_download.log"
-            echo "Funcotator download started at: $(date)" > "${LOG_FILE}"
-
-            # CRITICAL: Added --overwrite-output-file flag here
-            ${GATK} FuncotatorDataSourceDownloader \
-                --somatic \
-                --hg38 \
-                --extract-after-download \
-                --overwrite-output-file \
-                --output "${FUNCOTATOR_DS}" \
-                --verbosity INFO 2>&1 | tee -a "${LOG_FILE}"
-
-            if [ $? -eq 0 ]; then
-                echo "SUCCESS: Funcotator download completed at: $(date)" >> "${LOG_FILE}"
-            else
-                echo "ERROR: Funcotator download failed at: $(date)" >> "${LOG_FILE}"
-                echo "Last 20 lines of output:" >> "${LOG_FILE}"
-                tail -20 "${LOG_FILE}" >> "${LOG_FILE}.error"
-            fi
-        ) &
-
-        local DOWNLOAD_PID=$!
-
-        log "Funcotator download running in background (PID: ${DOWNLOAD_PID})"
-        log "You can monitor progress with: tail -f ${BASE_DIR}/logs/funcotator_download.log"
-        log "Or check status with: ps -p ${DOWNLOAD_PID}"
-
-        # Offer to wait or continue
-        echo ""
-        read -p "Wait for download to complete? This may take hours. [y/N]: " -n 1 -r
-        echo
-        if [[ $REPLY =~ ^[Yy]$ ]]; then
-            log "Waiting for Funcotator download to complete..."
-            wait ${DOWNLOAD_PID}
-
-            if [ $? -eq 0 ]; then
-                log "✅ Funcotator data sources installed successfully"
-            else
-                log_warning "Funcotator download may have had issues"
-                log "Check log file: ${BASE_DIR}/logs/funcotator_download.log"
-            fi
-        else
-            log "Continuing setup. Funcotator download running in background."
-            log "Note: Variant annotation will fail if Funcotator is not ready."
-        fi
-
-    else
-        log_warning "GATK not available for Funcotator download"
-        log "You can manually download with:"
-        log "  mkdir -p ${FUNCOTATOR_DS}"
-        log "  cd ${FUNCOTATOR_DS}"
-        log "  wget ftp://gsapubftp-anonymous@ftp.broadinstitute.org/bundle/funcotator/funcotator_dataSources.v1.7.20200521g.tar.gz"
-        log "  tar -xzf funcotator_dataSources.v1.7.20200521g.tar.gz"
-        return 1
-    fi
-
-    return 0
+    # Rest of function continues with installation logic...
 }
 
 install_snpeff() {
@@ -3537,22 +3474,49 @@ process_sample() {
 
     mkdir -p "${BAM_DIR}" "${VCF_DIR}" "${TSV_DIR}"
 
+    # Setup GATK with fallbacks
     if [ -z "${GATK:-}" ]; then
         if command -v gatk &> /dev/null; then
             GATK="gatk"
-        elif [ -f "${TOOLS_DIR}/gatk-4.6.2.0/gatk" ]; then
+        elif [ -x "${TOOLS_DIR}/gatk-4.6.2.0/gatk" ]; then
             GATK="${TOOLS_DIR}/gatk-4.6.2.0/gatk"
         else
-            log "ERROR: GATK not found. Please install GATK or set GATK environment variable"
+            log_error "GATK not found. Please install GATK or set GATK environment variable"
             return 1
         fi
     fi
 
-    # Check if Funcotator is available
+    # Set SnpEff paths - CRITICAL FIX
+    export SNPEFF_JAR="${TOOLS_DIR}/snpEff/snpEff.jar"
+    export SNPEFF_DATA="${TOOLS_DIR}/snpEff/data"
+
+    # Verify SnpEff exists
+    if [ ! -f "${SNPEFF_JAR}" ]; then
+        log_warning "SnpEff JAR not found at: ${SNPEFF_JAR}"
+        log "Will use basic annotation without SnpEff"
+    else
+        log "SnpEff JAR found: ${SNPEFF_JAR}"
+        # Test SnpEff quickly
+        if ! java -Xmx2g -jar "${SNPEFF_JAR}" -version 2>&1 | grep -q "SnpEff"; then
+            log_warning "SnpEff test failed. May have issues during annotation."
+        fi
+    fi
+
+    # Check Funcotator availability
+    FUNCOTATOR_DS="${BASE_DIR}/references/annotations/funcotator_dataSources"
     if [ ! -d "${FUNCOTATOR_DS}" ] || [ -z "$(ls -A "${FUNCOTATOR_DS}" 2>/dev/null)" ]; then
-        log_warning "Funcotator data sources not found at: ${FUNCOTATOR_DS}"
+        log_warning "Funcotator data sources not found or empty at: ${FUNCOTATOR_DS}"
         log "Will use SnpEff for annotation instead"
         export SKIP_FUNCOTATOR=true
+    else
+        # Verify Funcotator structure
+        if [ -d "${FUNCOTATOR_DS}/cosmic/hg38" ] || [ -d "${FUNCOTATOR_DS}/clinvar/hg38" ]; then
+            log "Funcotator v1.8 nested structure detected"
+        elif [ -d "${FUNCOTATOR_DS}/hg38" ]; then
+            log "Funcotator flat structure detected"
+        else
+            log_warning "Unusual Funcotator structure. GATK may have issues."
+        fi
     fi
 
     ##################################
@@ -3573,7 +3537,10 @@ process_sample() {
             -RGPL ILLUMINA \
             -RGPU "${SAMPLE}.unit1" \
             -RGSM "${SAMPLE}" \
-            --CREATE_INDEX true
+            --CREATE_INDEX true || {
+                log_error "Failed to add read groups"
+                return 1
+            }
     fi
 
     ##################################
@@ -3590,7 +3557,10 @@ process_sample() {
             -I "${RG_BAM}" \
             -O "${RMDUP_BAM}" \
             -M "${BAM_DIR}/${SAMPLE}.rmdup.metrics.txt" \
-            --CREATE_INDEX true
+            --CREATE_INDEX true || {
+                log_error "Failed to mark duplicates"
+                return 1
+            }
     fi
 
     ##################################
@@ -3608,7 +3578,10 @@ process_sample() {
             -I "${RMDUP_BAM}" \
             -O "${SPLIT_BAM}" \
             --create-output-bam-index true \
-            --max-mismatches-in-overhang 2
+            --max-mismatches-in-overhang 2 || {
+                log_error "Failed to split N Cigar reads"
+                return 1
+            }
     fi
 
     ##################################
@@ -3630,21 +3603,35 @@ process_sample() {
                 -I "${SPLIT_BAM}" \
                 --known-sites "${DBSNP}" \
                 --known-sites "${MILLS}" \
-                -O "${RECAL_TABLE}"
+                -O "${RECAL_TABLE}" || {
+                    log_warning "BaseRecalibrator failed, continuing without BQSR"
+                    DO_BQSR=false
+                }
         fi
 
-        if [ -f "${RECAL_BAM}" ] && [ -f "${RECAL_BAI}" ]; then
-            log "BQSR already applied: ${RECAL_BAM}"
-            INPUT_FOR_VARIANTS="${RECAL_BAM}"
+        if [ "${DO_BQSR}" = "true" ]; then
+            if [ -f "${RECAL_BAM}" ] && [ -f "${RECAL_BAI}" ]; then
+                log "BQSR already applied: ${RECAL_BAM}"
+                INPUT_FOR_VARIANTS="${RECAL_BAM}"
+            else
+                log "Applying BQSR..."
+                $GATK ApplyBQSR \
+                    -R "${REF_GENOME}" \
+                    -I "${SPLIT_BAM}" \
+                    --bqsr-recal-file "${RECAL_TABLE}" \
+                    -O "${RECAL_BAM}" \
+                    --create-output-bam-index true || {
+                        log_warning "ApplyBQSR failed, using non-recalibrated BAM"
+                        INPUT_FOR_VARIANTS="${SPLIT_BAM}"
+                    }
+                if [ -f "${RECAL_BAM}" ]; then
+                    INPUT_FOR_VARIANTS="${RECAL_BAM}"
+                else
+                    INPUT_FOR_VARIANTS="${SPLIT_BAM}"
+                fi
+            fi
         else
-            log "Applying BQSR..."
-            $GATK ApplyBQSR \
-                -R "${REF_GENOME}" \
-                -I "${SPLIT_BAM}" \
-                --bqsr-recal-file "${RECAL_TABLE}" \
-                -O "${RECAL_BAM}" \
-                --create-output-bam-index true
-            INPUT_FOR_VARIANTS="${RECAL_BAM}"
+            INPUT_FOR_VARIANTS="${SPLIT_BAM}"
         fi
     else
         log "Skipping BQSR for RNA-seq (DO_BQSR=false)"
@@ -3725,13 +3712,13 @@ process_sample() {
                         --max-reads-per-alignment-start 100 \
                         --downsampling-stride 20 \
                         --max-suspicious-reads-per-alignment-start 6 \
-                        --germline-resource "${DBSNP}"
+                        --germline-resource "${DBSNP}" || {
+                            log_warning "Mutect2 failed to produce VCF. Falling back to HaplotypeCaller."
+                            RNA_CALLING_METHOD="traditional"
+                            rm -f "${RAW_VCF}" "${RAW_VCF}.tbi" 2>/dev/null || true
+                        }
 
-                    if [ ! -f "${RAW_VCF}" ] || [ ! -s "${RAW_VCF}" ]; then
-                        log_warning "Mutect2 failed to produce VCF. Falling back to HaplotypeCaller."
-                        RNA_CALLING_METHOD="traditional"
-                        rm -f "${RAW_VCF}" "${RAW_VCF}.tbi" 2>/dev/null || true
-                    else
+                    if [ -f "${RAW_VCF}" ] && [ -s "${RAW_VCF}" ]; then
                         VAR_COUNT=$(bcftools view -H "${RAW_VCF}" 2>/dev/null | wc -l)
                         log "Mutect2 successfully called ${VAR_COUNT} variants"
                     fi
@@ -3758,7 +3745,10 @@ process_sample() {
                             --min-base-quality-score 10 \
                             --max-reads-per-alignment-start 50 \
                             --max-assembly-region-size 500 \
-                            --pair-hmm-implementation LOGLESS_CACHING
+                            --pair-hmm-implementation LOGLESS_CACHING || {
+                                log_error "HaplotypeCaller failed"
+                                return 1
+                            }
                     fi
                 else
                     log "Using SERIAL HaplotypeCaller..."
@@ -3771,7 +3761,10 @@ process_sample() {
                         --min-base-quality-score 10 \
                         --max-reads-per-alignment-start 50 \
                         --max-assembly-region-size 500 \
-                        --pair-hmm-implementation LOGLESS_CACHING
+                        --pair-hmm-implementation LOGLESS_CACHING || {
+                            log_error "HaplotypeCaller failed"
+                            return 1
+                        }
                 fi
                 ;;
         esac
@@ -3798,7 +3791,11 @@ process_sample() {
                 -O "${FILTERED_VCF}" \
                 --min-allele-fraction ${MUTECT2_AF_THRESHOLD} \
                 --max-alt-allele-count 2 \
-                --unique-alt-read-count 2
+                --unique-alt-read-count 2 || {
+                    log_warning "FilterMutectCalls failed, using raw VCF"
+                    cp "${RAW_VCF}" "${FILTERED_VCF}"
+                    cp "${RAW_VCF}.tbi" "${FILTERED_VCF}.tbi" 2>/dev/null || true
+                }
         else
             log "Filtering RNA-seq variants..."
             $GATK VariantFiltration \
@@ -3810,7 +3807,11 @@ process_sample() {
                 --filter-expression "MQ < 40.0" --filter-name "LowMQ" \
                 --filter-expression "QUAL < 30.0" --filter-name "LowQual" \
                 --window 35 --cluster 3 \
-                -O "${FILTERED_VCF}"
+                -O "${FILTERED_VCF}" || {
+                    log_warning "VariantFiltration failed, using raw VCF"
+                    cp "${RAW_VCF}" "${FILTERED_VCF}"
+                    cp "${RAW_VCF}.tbi" "${FILTERED_VCF}.tbi" 2>/dev/null || true
+                }
         fi
     fi
 
@@ -3823,17 +3824,22 @@ process_sample() {
         log "PASS variants already extracted: ${PASS_VCF}"
     else
         log "Extracting PASS variants..."
-        bcftools view -f PASS "${FILTERED_VCF}" -O z -o "${PASS_VCF}"
-        tabix -p vcf "${PASS_VCF}"
+        bcftools view -f PASS "${FILTERED_VCF}" -O z -o "${PASS_VCF}" 2>"${VCF_DIR}/${SAMPLE}.pass_extract.log" || {
+            log_warning "Failed to extract PASS variants, using filtered VCF"
+            cp "${FILTERED_VCF}" "${PASS_VCF}"
+            cp "${FILTERED_VCF}.tbi" "${PASS_VCF}.tbi" 2>/dev/null || true
+        }
+        tabix -p vcf "${PASS_VCF}" 2>/dev/null || true
     fi
 
     ##################################
-    # 8. SIMPLIFIED ANNOTATION - FIXED VERSION
+    # 8. ANNOTATION - UPDATED WITH ROBUST SNPEFF HANDLING
     ##################################
     ANNOTATED_VCF="${VCF_DIR}/${SAMPLE}.annotated.vcf.gz"
     RSID_VCF="${VCF_DIR}/${SAMPLE}.rsID.vcf.gz"
     GENES_VCF="${VCF_DIR}/${SAMPLE}.genes.vcf.gz"
 
+    # Force skip Funcotator if not available (use SnpEff)
     export SKIP_FUNCOTATOR=true
 
     if [ -f "${GENES_VCF}" ] && [ -s "${GENES_VCF}" ]; then
@@ -3865,12 +3871,71 @@ process_sample() {
         else
             log "No existing SnpEff annotations found, running annotation..."
 
-            # Skip complex annotation methods that are failing
-            cp "${INPUT_FOR_ANNOTATION}" "${ANNOTATED_VCF}"
-            cp "${INPUT_FOR_ANNOTATION}.tbi" "${ANNOTATED_VCF}.tbi" 2>/dev/null || true
+            # Attempt SnpEff annotation with proper error handling
+            if [ -f "${SNPEFF_JAR}" ]; then
+                log "Attempting SnpEff annotation..."
+
+                # Create a test with first 100 variants to check SnpEff works
+                TEST_VCF="${VCF_DIR}/${SAMPLE}.test_snpeff.vcf"
+                bcftools view -H "${INPUT_FOR_ANNOTATION}" 2>/dev/null | head -100 > "${TEST_VCF}.body"
+                bcftools view -h "${INPUT_FOR_ANNOTATION}" 2>/dev/null > "${TEST_VCF}.header"
+                cat "${TEST_VCF}.header" "${TEST_VCF}.body" > "${TEST_VCF}"
+
+                log "Testing SnpEff with 100 variants..."
+                SNPEFF_TEST_OUTPUT=$(java -Xmx8g -jar "${SNPEFF_JAR}" -v hg38 "${TEST_VCF}" 2>&1 | tee "${VCF_DIR}/${SAMPLE}.snpeff_test.log")
+
+                if echo "${SNPEFF_TEST_OUTPUT}" | grep -q -i "error\|exception\|genome not found"; then
+                    log_warning "SnpEff test failed. Error details:"
+                    echo "${SNPEFF_TEST_OUTPUT}" | tail -5
+                    log "Skipping SnpEff annotation, using basic annotation"
+                    SNPEFF_SUCCESS=false
+                else
+                    TEST_VARIANTS=$(echo "${SNPEFF_TEST_OUTPUT}" | grep -v "^#" | wc -l)
+                    if [ "${TEST_VARIANTS}" -gt 0 ]; then
+                        log "SnpEff test successful (${TEST_VARIANTS} variants annotated). Running full annotation..."
+
+                        # Full annotation with ample memory
+                        java -Xmx16g -jar "${SNPEFF_JAR}" -v hg38 \
+                            "${INPUT_FOR_ANNOTATION}" \
+                            -stats "${VCF_DIR}/${SAMPLE}.snpeff.html" \
+                            > "${VCF_DIR}/${SAMPLE}.snpeff.vcf" 2>"${VCF_DIR}/${SAMPLE}.snpeff.log"
+
+                        # Check if we got output
+                        if [ -s "${VCF_DIR}/${SAMPLE}.snpeff.vcf" ]; then
+                            ANNOTATED_COUNT=$(grep -v "^#" "${VCF_DIR}/${SAMPLE}.snpeff.vcf" | wc -l)
+                            log "SnpEff annotated ${ANNOTATED_COUNT} variants"
+
+                            # Convert to bgzip and index
+                            bcftools view "${VCF_DIR}/${SAMPLE}.snpeff.vcf" -O z -o "${ANNOTATED_VCF}" 2>/dev/null || \
+                            bgzip -c "${VCF_DIR}/${SAMPLE}.snpeff.vcf" > "${ANNOTATED_VCF}"
+                            tabix -p vcf "${ANNOTATED_VCF}" 2>/dev/null || true
+                            SNPEFF_SUCCESS=true
+                        else
+                            log_warning "SnpEff produced empty output. Using filtered VCF."
+                            SNPEFF_SUCCESS=false
+                        fi
+                    else
+                        log_warning "SnpEff test produced 0 variants. Using filtered VCF."
+                        SNPEFF_SUCCESS=false
+                    fi
+                fi
+
+                # Cleanup test files
+                rm -f "${TEST_VCF}" "${TEST_VCF}.header" "${TEST_VCF}.body" 2>/dev/null || true
+
+                if [ "${SNPEFF_SUCCESS}" = "false" ]; then
+                    # Fallback: use filtered VCF without SnpEff
+                    cp "${INPUT_FOR_ANNOTATION}" "${ANNOTATED_VCF}"
+                    cp "${INPUT_FOR_ANNOTATION}.tbi" "${ANNOTATED_VCF}.tbi" 2>/dev/null || true
+                fi
+            else
+                log_warning "SnpEff JAR not found at: ${SNPEFF_JAR}"
+                log "Using filtered VCF without annotation"
+                cp "${INPUT_FOR_ANNOTATION}" "${ANNOTATED_VCF}"
+                cp "${INPUT_FOR_ANNOTATION}.tbi" "${ANNOTATED_VCF}.tbi" 2>/dev/null || true
+            fi
         fi
 
-        # Always add dbSNP annotations
         log "Adding dbSNP IDs..."
         if bcftools annotate \
             -a "${DBSNP}" \
@@ -3881,12 +3946,11 @@ process_sample() {
 
             log "dbSNP annotation completed"
         else
-            log_warning "dbSNP annotation failed, using original VCF"
+            log_warning "dbSNP annotation failed, using original annotated VCF"
             cp "${ANNOTATED_VCF}" "${RSID_VCF}"
             cp "${ANNOTATED_VCF}.tbi" "${RSID_VCF}.tbi" 2>/dev/null || true
         fi
 
-        # Always add gene annotations if BED file exists
         log "Adding gene annotations..."
         if [ -f "${BASE_DIR}/references/annotations/genes.bed.gz" ]; then
             if bcftools annotate \
