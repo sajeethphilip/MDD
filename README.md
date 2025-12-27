@@ -286,3 +286,31 @@ flowchart TD
     Q --> S[End: Analysis Failed]
   
 ```
+# Multi directory setup process
+
+```mermaid
+flowchart TD
+    A[Start Setup] --> B[Scan for Directories]
+    B --> C[Identify MDD Patterns<br/>analysis2, mdd, case, MDD]
+    B --> D[Identify Control Patterns<br/>analysisCtrl, control, ctrl]
+    B --> E[Identify Other Directories]
+    
+    C --> F[List MDD Directories]
+    D --> G[List Control Directories]
+    E --> H[List Other Directories]
+    
+    F --> I[Interactive MDD Selection]
+    G --> J[Interactive Control Selection]
+    H --> K[Additional Options]
+    
+    I --> L[Validate MDD Directory]
+    J --> M[Validate Control Directory]
+    
+    L & M --> N[Collect TSV Files]
+    
+    N --> O[Create Unified Structure]
+    O --> P[Create Symlinks/Copies]
+    P --> Q[Generate Project Mapping]
+    Q --> R[Create Output Directories]
+    R --> S[Setup Complete]
+```
