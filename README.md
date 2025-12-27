@@ -291,26 +291,192 @@ flowchart TD
 ```mermaid
 flowchart TD
     A[Start Setup] --> B[Scan for Directories]
-    B --> C[Identify MDD Patterns<br/>analysis2, mdd, case, MDD]
-    B --> D[Identify Control Patterns<br/>analysisCtrl, control, ctrl]
-    B --> E[Identify Other Directories]
+    B --> C[Identify MDD Directories]
+    B --> D[Identify Control Directories]
     
-    C --> F[List MDD Directories]
-    D --> G[List Control Directories]
-    E --> H[List Other Directories]
+    C --> E[List MDD Options]
+    D --> F[List Control Options]
     
-    F --> I[Interactive MDD Selection]
-    G --> J[Interactive Control Selection]
-    H --> K[Additional Options]
+    E --> G[Interactive Selection]
+    F --> G
     
-    I --> L[Validate MDD Directory]
-    J --> M[Validate Control Directory]
+    G --> H[Validate Directories]
+    H --> I[Collect TSV Files]
+    I --> J[Create Unified Structure]
+    J --> K[Generate Project Mapping]
+    K --> L[Setup Complete]
+```
+#  Differential SNP Analysis Core Algorithm
+```mermaid
+flowchart TD
+    A[Start SNP Analysis] --> B[Load Project Mapping]
+    B --> C[Collect All TSV Files]
+    C --> D[Initialize Data Structures]
     
-    L & M --> N[Collect TSV Files]
+    D --> E[Process Each Sample]
     
-    N --> O[Create Unified Structure]
-    O --> P[Create Symlinks/Copies]
-    P --> Q[Generate Project Mapping]
-    Q --> R[Create Output Directories]
-    R --> S[Setup Complete]
+    subgraph E [Sample Processing]
+        F[Read TSV File]
+        F --> G[Extract SNP Info]
+        G --> H[Create SNP Key]
+        H --> I[Store in Group Dictionary]
+    end
+    
+    I --> J{More Samples?}
+    J -->|Yes| E
+    J -->|No| K[Calculate Frequencies]
+    
+    K --> L[Apply 95% Threshold]
+    L --> M{SNP Differential?}
+    M -->|Yes| N[Mark as Differential]
+    M -->|No| O[Skip]
+    
+    N --> P{More SNPs?}
+    O --> P
+    
+    P -->|Yes| L
+    P -->|No| Q[Rank Results]
+    
+    Q --> R[Generate Output]
+    R --> S[Analysis Complete]
+```
+
+# TSV File Processing & SNP Extraction
+```mermaid
+flowchart TD
+    A[Start TSV Processing] --> B[Open File]
+    B --> C[Skip Header]
+    C --> D[Read Line]
+    D --> E{Split by Tab}
+    E -->|Valid| F[Extract Columns]
+    E -->|Invalid| G[Skip Line]
+    
+    F --> H[Create SNP Key]
+    H --> I[Store Data]
+    
+    I --> J{More Lines?}
+    G --> J
+    
+    J -->|Yes| D
+    J -->|No| K[Return Results]
+```
+# Output File Generation
+```mermaid
+flowchart TD
+    A[Start Output Generation] --> B[Differential SNPs DataFrame]
+    
+    B --> C[Generate All SNPs TSV]
+    B --> D[Separate by Specificity]
+    
+    D --> E{Control-specific SNPs?}
+    D --> F{MDD-specific SNPs?}
+    
+    E -->|Yes| G[Top 15 Control-specific TSV]
+    E -->|No| H[No Control-specific file]
+    
+    F -->|Yes| I[Top 15 MDD-specific TSV]
+    F -->|No| J[No MDD-specific file]
+    
+    G & I --> K[Create Excel Report]
+    K --> L[Sheets:<br/>Control_Specific, MDD_Specific,<br/>All_Differential_SNPs, Summary]
+    
+    C & G & I & L --> M[Create Text Summary]
+    M --> N[Compile Analysis Statistics]
+    N --> O[Generate Human-readable Report]
+    
+    O --> P[Final Output Files]
+    
+    subgraph P [Output Files]
+        Q[all_differential_snps.tsv]
+        R[top_15_control_specific_snps.tsv]
+        S[top_15_mdd_specific_snps.tsv]
+        T[differential_snps_report.xlsx]
+        U[analysis_summary.txt]
+        V[analysis.log]
+    end
+
+```
+
+# Statistical Analysis
+```mermaid
+flowchart TD
+    A[Start Stats] --> B[Group Counts]
+    B --> C[Calculate Thresholds]
+    C --> D[Process Each SNP]
+    
+    subgraph D [SNP Evaluation]
+        E[Count in Control]
+        F[Count in MDD]
+        E --> G[Calculate Frequencies]
+        F --> G
+        G --> H{Check Criteria}
+    end
+    
+    H -->|Differential| I[Store Result]
+    H -->|Not Differential| J[Skip]
+    
+    I --> K{More SNPs?}
+    J --> K
+    
+    K -->|Yes| D
+    K -->|No| L[Calculate Totals]
+    L --> M[Stats Complete]
+
+```
+#  Error Handling
+```mermaid
+flowchart TD
+    A[Operation Start] --> B{Execute Step}
+    B --> C{Success?}
+    C -->|Yes| D[Log Success]
+    C -->|No| E[Log Error]
+    
+    D --> F[Continue]
+    E --> G{Critical?}
+    
+    G -->|Yes| H[Exit with Error]
+    G -->|No| I[Display Warning]
+    I --> F
+    
+    F --> J{Complete?}
+    J -->|No| B
+    J -->|Yes| K[Final Log]
+    K --> L[Done]
+```
+# Directory Selection
+
+```mermaid
+flowchart TD
+    A[Start Selection] --> B[Scan Directories]
+    B --> C[Display Options]
+    C --> D[User Choice]
+    D --> E{Custom Path?}
+    
+    E -->|Yes| F[Enter Path]
+    F --> G{Valid?}
+    G -->|No| F
+    G -->|Yes| H[Check Files]
+    
+    E -->|No| I[Use Listed Path]
+    
+    H --> J{Has TSV?}
+    J -->|Yes| K[Accept]
+    J -->|No| L[Warn User]
+    L --> M{Continue Anyway?}
+    M -->|No| F
+    M -->|Yes| K
+    
+    I --> K
+    K --> N[Selection Complete]
+```
+# File Processing Pipeline
+```mermaid
+flowchart LR
+    A[Source Files] --> B[Collection]
+    B --> C[Decompression]
+    C --> D[Parsing]
+    D --> E[Data Extraction]
+    E --> F[Key Generation]
+    F --> G[Storage]
+    G --> H[Analysis Ready]
 ```
